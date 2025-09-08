@@ -319,6 +319,45 @@ def _pptx_replace_in_shape(shape, replacements: dict):
         for sub in shape.shapes:
             _pptx_replace_in_shape(sub, replacements)
 
+def _prefill_last_year_from_prompts(excel_file, context: str) -> str | None:
+    """
+    Pre-step: fill Column E (last year value) using AI, based on prompt in Column D.
+    Returns a temp file path to the updated workbook, or None on error.
+    """
+    try:
+        wb = openpyxl.load_workbook(excel_file)
+    except Exception:
+        return None
+
+    try:
+        ws = wb.active
+        for row in ws.iter_rows(min_row=2, max_col=6):
+            cells = list(row) + [None] * max(0, 6 - len(row))
+            cell_pr  = cells[3]  # D: prompt
+            cell_old = cells[4]  # E: last year value to (re)fill
+
+            prompt_text = (str(cell_pr.value).strip() if cell_pr and cell_pr.value is not None else "")
+            if not prompt_text:
+                # No prompt, skip this row
+                continue
+
+            try:
+                value = get_llm_response_azure(prompt_text, context)
+                value = str(value).strip()
+                if value:
+                    ws.cell(row=cell_old.row, column=5, value=value)  # write to E
+            except Exception:
+                # On failure, leave existing E as-is
+                pass
+
+        # Save to a temp file and return its path
+        tmpdir = tempfile.mkdtemp()
+        out_path = os.path.join(tmpdir, "variables_prefilled_last_year.xlsx")
+        wb.save(out_path)
+        return out_path
+    except Exception:
+        return None
+
 
 def replace_first_slide_placeholders_pptx(prs: Presentation, replacements: dict):
     """Replace placeholders on the first slide ONLY."""
@@ -383,15 +422,12 @@ def _build_fallback_docx(replacements: dict, context: str) -> str:
     return out.name
 
 
-def process_and_fill(files: dict) -> str:
+
+
+def process_and_fill(files: dict, prefill_last_year: bool = False):
     """
-    files: {
-      'guidelines': <io or None>,
-      'transcript': <io docx or None>,
-      'pdf': <io pdf or None>,
-      'excel': <io xlsx or None>,
-      'template': <io pptx or docx or None>
-    }
+    files: {...}
+    prefill_last_year: if True, pre-fill Column E using AI prompts in Column D before replacement.
     """
     # Defensive dict access
     guidelines = files.get("guidelines") if files else None
@@ -400,7 +436,7 @@ def process_and_fill(files: dict) -> str:
     excel = files.get("excel") if files else None
     template = files.get("template") if files else None
 
-    # Build context (all loaders are safe on None)
+    # Build context
     ctx = ""
     ctx += load_guidelines(guidelines)
     tr_text = load_transcript(transcript)
@@ -410,15 +446,22 @@ def process_and_fill(files: dict) -> str:
     if pdf_text:
         ctx += ("\n\n" if ctx else "") + pdf_text
 
+    # NEW: optionally pre-fill Column E based on prompts in Column D
+    excel_for_processing = excel
+    if prefill_last_year and excel:
+        maybe_prefilled_path = _prefill_last_year_from_prompts(excel, ctx)
+        if maybe_prefilled_path:
+            excel_for_processing = maybe_prefilled_path  # use the updated workbook
+
     # Build replacements dict (and annotate Excel with generated values if present)
-    replacements, filled_excel_path = load_and_annotate_replacements(excel, ctx) if excel else ({}, None)
+    replacements, filled_excel_path = load_and_annotate_replacements(excel_for_processing, ctx) if excel_for_processing else ({}, None)
 
     # Decide template type
     template_name = (getattr(template, "name", "") or "").lower()
     is_pptx = template_name.endswith(".pptx") if template else False
     is_docx = template_name.endswith(".docx") if template else False
 
-    # If there's no template at all, produce a fallback DOCX so the app still returns a file.
+    # If there's no template at all, produce a fallback DOCX
     if not template:
         doc_path = _build_fallback_docx(replacements, ctx)
         return (doc_path, filled_excel_path)
@@ -429,7 +472,6 @@ def process_and_fill(files: dict) -> str:
         except Exception:
             doc_path = _build_fallback_docx(replacements, ctx)
             return (doc_path, filled_excel_path)
-
         replace_first_slide_placeholders_pptx(prs, replacements)
         replace_placeholders_pptx(prs, replacements, start_slide_index=1)
         out = tempfile.NamedTemporaryFile(delete=False, suffix=".pptx")
@@ -442,7 +484,6 @@ def process_and_fill(files: dict) -> str:
         except Exception:
             doc_path = _build_fallback_docx(replacements, ctx)
             return (doc_path, filled_excel_path)
-
         replace_first_page_placeholders_docx(doc, replacements)
         replace_placeholders_docx(doc, replacements)
         out = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
