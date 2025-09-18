@@ -11,8 +11,8 @@ configure(
     st.secrets["AZURE_API_ENDPOINT"]
 )
 
-st.set_page_config(page_title="TP Template Filler", layout="wide")
-st.title("Transfer Pricing Document Filler")
+st.set_page_config(page_title="TP Template Updater", layout="wide")
+st.title("Transfer Pricing Document Updater")
 
 st.download_button(
     "Download variables excel",
