@@ -1,8 +1,9 @@
 import io
+import os
 import tempfile
 import pandas as pd
 import streamlit as st
-from processor import configure, process_and_fill
+from processor import configure, find_relevant_variables, fill_section_values,generate_doc_from_excel_map
 
 # Configure backend with secrets
 configure(
@@ -60,6 +61,17 @@ if "view_df" not in st.session_state:
     st.session_state.view_df = None         # only columns A, E, F
 if "filled_excel_path" not in st.session_state:
     st.session_state.filled_excel_path = None
+if "step2_ready" not in st.session_state:
+    st.session_state.step2_ready = False
+if "section_excel_path" not in st.session_state:
+    st.session_state.section_excel_path = None  # Excel after section-filling step
+
+# Helper: write DF to a Windows-safe temp file and return the PATH
+def _df_to_temp_xlsx_path(df: pd.DataFrame) -> str:
+    fd, path = tempfile.mkstemp(suffix=".xlsx")
+    os.close(fd)  # close OS handle so pandas can write freely on Windows
+    df.to_excel(path, index=False)
+    return path
 
 # Build the file_map used by the backend; pass None for missing optionals
 base_file_map = {
@@ -98,17 +110,10 @@ def pick_view_columns(df: pd.DataFrame):
 
 # -------- STEP 1: Fill & preview variables (no template replacement yet) --------
 def run_step1_fill_and_preview():
-    if not variables_file:
-        st.error("Please upload the Variables (.xlsx) file for Step 1.")
-        return
-
     with st.spinner("Filling variables…"):
         try:
-            # Call backend but *skip* template replacement by passing template=None
             file_map_preview = dict(base_file_map)
-            file_map_preview["template"] = None  # forces fallback DOCX; we'll ignore it
-
-            result = process_and_fill(file_map_preview, prefill_last_year=prefill_last_year)
+            result = find_relevant_variables(file_map_preview)
 
             # Normalize return: (doc_path, excel_path) or just doc_path
             if isinstance(result, tuple):
@@ -116,16 +121,10 @@ def run_step1_fill_and_preview():
             else:
                 _doc_path, excel_path = result, None
 
-            if not excel_path:
-                st.error("Could not create the filled variables sheet.")
-                return
-
             st.session_state.filled_excel_path = excel_path
             full_df = pd.read_excel(excel_path, engine="openpyxl")
             st.session_state.full_df = full_df
-
-            view_cols = pick_view_columns(full_df)
-            st.session_state.view_df = full_df[view_cols].copy()
+            st.session_state.view_df = full_df.copy()
 
             st.success("Variables filled. Review and edit the selected columns below, then proceed to Step 2.")
         except Exception as e:
@@ -134,65 +133,143 @@ def run_step1_fill_and_preview():
 st.button("Step 1 – Fill & preview variables", on_click=run_step1_fill_and_preview)
 
 # If we have a view_df, show it as an editable table (only A, E, F)
-if st.session_state.view_df is not None:
-    st.subheader("Edit variables: ")
-    edited_view_df = st.data_editor(
+if st.session_state.view_df is not None and not st.session_state.step2_ready:
+    st.subheader("Step 1 edits")
+    edited_view_df_step1 = st.data_editor(
         st.session_state.view_df,
         use_container_width=True,
         num_rows="dynamic",
-        key="variables_editor_aef",
+        key="editor_step1",
     )
-    # Persist the edited view
-    st.session_state.view_df = edited_view_df
+    # persist edits from step 1 table
+    merged_df = st.session_state.full_df.copy()
+    for col in edited_view_df_step1.columns:
+        if col in merged_df.columns:
+            merged_df[col] = edited_view_df_step1[col]
 
-    # Optional download of the edited view
-    toexcel = io.BytesIO()
-    edited_view_df.to_excel(toexcel, index=False)
+    # Save to Windows-safe temp PATH and remember it
+    tmp_after_edit_1 = _df_to_temp_xlsx_path(merged_df)
+    st.session_state.filled_excel_path = tmp_after_edit_1  # latest SoT for Step 3
+
+    # (optional) download button for step 1 editor
+    toexcel1 = io.BytesIO()
+    edited_view_df_step1.to_excel(toexcel1, index=False)
     st.download_button(
-        "Download current edited view (A,E,F)",
-        data=toexcel.getvalue(),
-        file_name="variables_view_aef.xlsx",
+        "Download current edited view (Step 1)",
+        data=toexcel1.getvalue(),
+        file_name="variables_view_step1.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="dl_current_vars_view",
+        key="dl_step1",
     )
 
-# -------- STEP 2: Generate final document using the edited values --------
-def run_step2_generate():
-    if st.session_state.view_df is None or st.session_state.full_df is None:
+def run_step2_fill_sections():
+    if st.session_state.view_df is None:
         st.error("Please run Step 1 and review/edit the variables first.")
         return
-    if not template_file:
-        st.error("Please upload the Template (.pptx/.docx) for Step 2.")
-        return
 
-    with st.spinner("Generating final document…"):
+    with st.spinner("Filling section values…"):
         try:
-            # Merge edits (A,E,F) back into the full dataframe
+            # Merge current edits back into the full sheet
             full_df = st.session_state.full_df.copy()
             view_df = st.session_state.view_df
-
-            # Align on column names present in view_df
             for col in view_df.columns:
                 if col in full_df.columns:
                     full_df[col] = view_df[col]
 
-            # Write the merged full sheet to a temp Excel and pass to backend
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
-            full_df.to_excel(tmp.name, index=False)
+            # Save merged DF to PATH and pass PATH to backend
+            tmp_path = _df_to_temp_xlsx_path(full_df)
 
             file_map2 = dict(base_file_map)
-            file_map2["excel"] = open(tmp.name, "rb")  # pass file-like to backend
+            file_map2["excel"] = tmp_path  # pass PATH, not open file
 
-            # We already edited final values; avoid prefill at this stage
-            result = process_and_fill(file_map2, prefill_last_year=False)
+            result = fill_section_values(file_map2)
 
-            # Normalize return (support old: str; new: tuple)
+            section_excel_path = result[1] if isinstance(result, tuple) else result
+            if not section_excel_path:
+                st.error("Section-filling step did not return a valid Excel path.")
+                return
+
+            st.session_state.section_excel_path = section_excel_path
+            st.session_state.step2_ready = True
+
+            df2 = pd.read_excel(section_excel_path, engine="openpyxl")
+            st.session_state.full_df = df2
+            st.session_state.view_df = df2.copy()
+
+            # Seed SoT to the just-produced file (user edits may override this later)
+            st.session_state.filled_excel_path = section_excel_path
+
+            st.success("Section values filled. You can now review/edit them below, then proceed to Step 3.")
+        except Exception as e:
+            st.error(f"Error in Step 2: {e}")
+
+st.button("Step 2 – Fill section values", on_click=run_step2_fill_sections)
+
+if st.session_state.step2_ready and st.session_state.section_excel_path:
+    st.subheader("Step 2 edits (section-filled)")
+    edited_view_df_step2 = st.data_editor(
+        st.session_state.view_df,
+        use_container_width=True,
+        num_rows="dynamic",
+        key="editor_step2",
+    )
+    # persist edits from step 2 table
+    merged_df2 = st.session_state.full_df.copy()
+    for col in edited_view_df_step2.columns:
+        if col in merged_df2.columns:
+            merged_df2[col] = edited_view_df_step2[col]
+
+    # Save to PATH and update SoT for Step 3
+    tmp_after_edit_2 = _df_to_temp_xlsx_path(merged_df2)
+    st.session_state.filled_excel_path = tmp_after_edit_2  # latest SoT
+
+    # (optional) download button for step 2 editor
+    toexcel2 = io.BytesIO()
+    edited_view_df_step2.to_excel(toexcel2, index=False)
+    st.download_button(
+        "Download current edited view (Step 2)",
+        data=toexcel2.getvalue(),
+        file_name="variables_view_step2.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_step2",
+    )
+
+# -------- STEP 3: Generate final document using the edited values --------
+def run_step3_generate():
+    if st.session_state.view_df is None or st.session_state.full_df is None:
+        st.error("Please run Step 1 (and Step 2 if desired) before generating.")
+        return
+    if not template_file:
+        st.error("Please upload the Template (.pptx/.docx) for Step 3.")
+        return
+
+    with st.spinner("Generating final document…"):
+        try:
+            # Merge any last edits
+            full_df = st.session_state.full_df.copy()
+            view_df = st.session_state.view_df
+            for col in view_df.columns:
+                if col in full_df.columns:
+                    full_df[col] = view_df[col]
+
+            # Prefer the latest edited workbook path
+            excel_path_for_generation = st.session_state.get("filled_excel_path")
+            if not excel_path_for_generation:
+                # Fallback: write current merged DF to PATH
+                excel_path_for_generation = _df_to_temp_xlsx_path(full_df)
+                st.session_state.filled_excel_path = excel_path_for_generation
+
+            file_map2 = dict(base_file_map)
+            file_map2["excel"] = excel_path_for_generation  # pass PATH
+
+            # Generate doc (no prefill here)
+            result = generate_doc_from_excel_map(file_map2)
+
             if isinstance(result, tuple):
                 doc_path, excel_path = result
             else:
                 doc_path, excel_path = result, None
 
-            # Read bytes now and keep in session_state so downloads persist across reruns
             with open(doc_path, "rb") as f:
                 doc_bytes = f.read()
 
@@ -222,9 +299,9 @@ def run_step2_generate():
             st.success("Done—download below.")
         except Exception as e:
             st.session_state.generated = None
-            st.error(f"Error in Step 2: {e}")
+            st.error(f"Error in Step 3: {e}")
 
-st.button("Step 2 – Generate final document", on_click=run_step2_generate)
+st.button("Step 3 – Generate final document", on_click=run_step3_generate)
 
 # Downloads (persist via session_state so no re-generation on click)
 gen = st.session_state.generated

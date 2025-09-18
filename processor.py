@@ -10,11 +10,17 @@ import pandas as pd
 import os
 import tempfile
 import requests
-# (rest of your imports stay the same)
-
-# NEW: pptx support
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
+import openpyxl
+import tempfile
+import os
+import csv
+from io import StringIO
+import os, io, tempfile, openpyxl
+from collections import OrderedDict
+from docx import Document
+from typing import Tuple, Dict
 
 # ——— Azure OpenAI config ———
 # Expect these to be set by the Streamlit frontend via secrets or environment variables
@@ -99,99 +105,95 @@ def load_guidelines(file) -> str:
         return ""
 
 
-def load_and_annotate_replacements(excel_file, context: str):
+def load_and_annotate_replacements(excel_file, context: str) -> Tuple[Dict[str, str], str | None]:
     """
-    TEMPLATE:
-      - Col A: variable_name (info)
-      - Col B: placeholder (token used inside prompts)
-      - Col C: (unused here)
-      - Col D: prompt (may include placeholders from Col B)
-      - Col E: last year value (OLD; text to find in docs)
-      - Col F: this year's value (NEW; replacement)
-    Behavior:
-      - Only use AI if F is blank AND D is non-empty.
-      - Before AI call, substitute any known placeholders in D with their resolved NEW values.
+    New behavior for 4-column sheet:
+      Columns (A..D): placeholder_name, old_value, prompt, new_value
+
+      - If 'prompt' is not empty, query LLM via get_llm_response_azure(prompt, context)
+        and write the response into 'new_value' (D).
+      - Build replacements_dict as: { old_value -> new_value } for rows that have a non-empty new_value.
 
     Returns:
       (replacements_dict, filled_excel_path)
-        - replacements_dict: { old_value (Col E) -> resolved_new_value (Col F) }
-        - filled_excel_path: absolute path to a temp 'variables_filled.xlsx' copy (or None on error)
+        - replacements_dict: { old_value -> new_value } (only rows with non-empty new_value)
+        - filled_excel_path: absolute path to a temp 'variables_filled.xlsx' copy
+                             (a valid path even if workbook was created blank)
     """
-    if not excel_file:
-        return {}, None
+    # --- Try to load the workbook; if it fails, create a blank one with headers ---
     try:
         wb = openpyxl.load_workbook(excel_file)
+        ws = wb.active
     except Exception:
-        return {}, None
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "variables"
+        ws.append(["placeholder_name", "old_value", "prompt", "new_value"])
 
+    # --- Resolve column indices based on headers (row 1), fallback to A..D ---
+    header_map = {}
+    try:
+        headers = [str(c.value).strip().lower() if c.value is not None else "" for c in ws[1]]
+    except Exception:
+        headers = []
+
+    def _find_col(name: str, default_idx: int) -> int:
+        try:
+            idx = headers.index(name)
+            return idx + 1  # openpyxl is 1-based
+        except ValueError:
+            return default_idx
+
+    col_placeholder = _find_col("placeholder_name", 1)  # A
+    col_old        = _find_col("old_value", 2)          # B
+    col_prompt     = _find_col("prompt", 3)             # C
+    col_new        = _find_col("new_value", 4)          # D
+
+    replacements: Dict[str, str] = {}
+
+    # --- Iterate rows, starting at row 2 ---
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+        r = row[0].row  # current row index
+
+        # Safely read cells
+        def _get(col_idx: int) -> str:
+            try:
+                val = ws.cell(row=r, column=col_idx).value
+                return str(val).strip() if val is not None else ""
+            except Exception:
+                return ""
+
+        placeholder_name = _get(col_placeholder)
+        old_value        = _get(col_old)
+        prompt_text      = _get(col_prompt)
+        new_value_curr   = _get(col_new)
+
+        # If prompt present, query LLM and write into new_value
+        if prompt_text:
+            try:
+                llm_out = get_llm_response_azure(prompt_text, context)
+                llm_out = (llm_out or "").strip()
+                # Write to the cell even if empty (clears previous content if any)
+                ws.cell(row=r, column=col_new, value=llm_out)
+                new_value_curr = llm_out
+            except Exception:
+                # On error, leave whatever was already in new_value
+                pass
+
+        # Build replacements only when new_value is non-empty
+        if old_value and new_value_curr:
+            replacements[old_value] = new_value_curr
+
+    # --- Always create a downloadable temp copy named variables_filled.xlsx ---
     filled_excel_path = None
     try:
-        ws = wb.active
-        replacements = {}
-        placeholder_to_new = {}
-
-        for row in ws.iter_rows(min_row=2, max_col=6):
-            cells = list(row) + [None] * max(0, 6 - len(row))
-            cell_var = cells[0]  # A (unused for logic)
-            cell_ph  = cells[1]  # B placeholder
-            # cells[2] is C (ignored)
-            cell_pr  = cells[3]  # D prompt
-            cell_old = cells[4]  # E last year (OLD)
-            cell_new = cells[5]  # F this year (NEW)
-
-            placeholder = (str(cell_ph.value).strip() if cell_ph and cell_ph.value is not None else "")
-            old_val     = (str(cell_old.value).strip() if cell_old and cell_old.value is not None else "")
-            new_val_in  = (str(cell_new.value).strip() if cell_new and cell_new.value is not None else "")
-            prompt_text = (str(cell_pr.value).strip() if cell_pr and cell_pr.value is not None else "")
-
-            if not old_val:
-                if placeholder and new_val_in:
-                    placeholder_to_new[placeholder] = new_val_in
-                continue
-
-            if new_val_in:
-                resolved_new = new_val_in
-            else:
-                if prompt_text:
-                    prompt_rendered = prompt_text
-                    if placeholder_to_new:
-                        for ph_tok, ph_new in placeholder_to_new.items():
-                            if ph_tok:
-                                prompt_rendered = prompt_rendered.replace(ph_tok, ph_new)
-                    try:
-                        resolved_new = get_llm_response_azure(prompt_rendered, context)
-                        resolved_new = str(resolved_new).strip() or old_val
-                    except Exception:
-                        resolved_new = old_val
-                else:
-                    resolved_new = old_val
-
-                try:
-                    ws.cell(row=cell_old.row, column=6, value=resolved_new)
-                except Exception:
-                    pass
-
-            replacements[old_val] = resolved_new
-            if placeholder:
-                placeholder_to_new[placeholder] = resolved_new
-
-        # Try saving back to the uploaded stream (best-effort, may be a no-op for some file-like objects)
-        try:
-            wb.save(excel_file)
-        except Exception:
-            pass
-
-        # Always create a downloadable temp copy named variables_filled.xlsx
-        try:
-            tmpdir = tempfile.mkdtemp()
-            filled_excel_path = os.path.join(tmpdir, "variables_filled.xlsx")
-            wb.save(filled_excel_path)
-        except Exception:
-            filled_excel_path = None
-
-        return replacements, filled_excel_path
+        tmpdir = tempfile.mkdtemp()
+        filled_excel_path = os.path.join(tmpdir, "variables_filled.xlsx")
+        wb.save(filled_excel_path)
     except Exception:
-        return {}, None
+        filled_excel_path = None
+
+    return replacements, filled_excel_path
 
 
 # =========================
@@ -319,45 +321,197 @@ def _pptx_replace_in_shape(shape, replacements: dict):
         for sub in shape.shapes:
             _pptx_replace_in_shape(sub, replacements)
 
+def ask_variable_list(context: str) -> str:
+    headers = {"Content-Type": "application/json", "api-key": API_KEY}
+    CHANGE_PLAN_PROMPT = """
+    You are a meticulous placeholder auditor for corporate documents (transfer pricing + finance context).
+
+    GOAL
+    From the provided company data ("CONTEXT"), output a clean, machine-readable table of everything that must be updated in the document/template.
+
+    TABLE SCHEMA (CSV, no markdown, include header)
+    placeholder_name,old_value,prompt,new_value
+
+    DEFINITIONS
+    - A placeholder can refer to: a word, number, date, name, paragraph, or a whole section.
+    - "old_value" = the value currently implied by CONTEXT (e.g., last year’s value, outdated name/date, prior transaction figure).
+    - "new_value" = the updated value you can infer from CONTEXT with high confidence.
+    - "prompt" = ONLY used when the placeholder refers to a whole section that needs rewriting. In that case, write a clear instruction another LLM can use to generate the section (reference the concrete facts available in CONTEXT). For non-section placeholders, leave "prompt" blank.
+
+    RULES
+    1) Output ONLY CSV with the exact header:
+    placeholder_name,old_value,prompt,new_value
+    No commentary, no extra columns, no markdown.
+    2) If you are NOT ≥80% confident about the correct new value, leave new_value empty.
+    3) Keep values terse and precise (no vague phrases like “appears to be”).
+    4) Prefer exact spans from CONTEXT for old_value and new_value when possible.
+    5) Identify changes including (but not limited to):
+    - Company/Group/Entity names; addresses; legal identifiers
+    - Fiscal years, dates, periods (e.g., 2023 → 2024)
+    - Financials (revenue, EBIT, margins, headcount, transaction values)
+    - Functions, assets, risks; intercompany transactions; counterparties
+    - Benchmarks/comparables references
+    - Governance/personnel changes (roles, titles)
+    - Jurisdictions, regulations, citations that changed
+    - Any section that must be rewritten due to updated facts
+    6) For SECTION-LEVEL placeholders, set placeholder_name to a clear label (e.g., SECTION:Functional Analysis),
+    old_value to a short excerpt/summary of the current stance, prompt to a concrete writing instruction,
+    and new_value empty (the other LLM will fill it).
+    7) Limit each cell to essential text. Avoid line breaks in cells. Escape commas with quotes if needed.
+
+    CONTEXT
+    <<<CONTEXT_START
+    {context}
+    CONTEXT_END>>>
+
+    TASK
+    Produce the CSV now.
+    """
+
+    system_msg = (
+        "You are a precise placeholder auditor that emits ONLY compact CSV suitable for direct ingestion. "
+        "Do not use markdown, bullets, or explanations. Keep outputs concise and never vague."
+    )
+
+    # If you keep `prompt` external, pass CHANGE_PLAN_PROMPT and format {context} beforehand.
+    # Here we always append the contextualized prompt after the system message.
+    messages = [
+        {"role": "system", "content": system_msg},
+        {
+            "role": "user",
+            "content": CHANGE_PLAN_PROMPT.format(context=context)  # expects {context} in the prompt
+        },
+    ]
+    resp = requests.post(API_ENDPOINT, headers=headers, json={"messages": messages})
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"].strip()
+
+
+
+
 def _prefill_last_year_from_prompts(excel_file, context: str) -> str | None:
     """
-    Pre-step: fill Column E (last year value) using AI, based on prompt in Column D.
-    Returns a temp file path to the updated workbook, or None on error.
+    Creates/updates an Excel workbook of variables based on ask_variable_list(context).
+    If excel_file cannot be loaded, a new workbook is created with columns:
+    placeholder_name, old_value, prompt, new_value.
+    
+    The output of ask_variable_list(context) (CSV text) is parsed and rows are
+    added to this workbook. Returns a temp file path to the updated workbook,
+    or None on error.
     """
     try:
-        wb = openpyxl.load_workbook(excel_file)
-    except Exception:
-        return None
+        # Try to load the Excel, otherwise create a new workbook with required columns
+        try:
+            wb = openpyxl.load_workbook(excel_file)
+            ws = wb.active
+        except Exception:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "variables"
+            ws.append(["placeholder_name", "old_value", "prompt", "new_value"])
 
-    try:
-        ws = wb.active
-        for row in ws.iter_rows(min_row=2, max_col=6):
-            cells = list(row) + [None] * max(0, 6 - len(row))
-            cell_pr  = cells[3]  # D: prompt
-            cell_old = cells[4]  # E: last year value to (re)fill
+        # Get CSV from the LLM
+        csv_output = ask_variable_list(context)
+        if not csv_output:
+            return None
 
-            prompt_text = (str(cell_pr.value).strip() if cell_pr and cell_pr.value is not None else "")
-            if not prompt_text:
-                # No prompt, skip this row
-                continue
+        # Parse CSV safely
+        reader = csv.DictReader(StringIO(csv_output))
+        required_cols = ["placeholder_name", "old_value", "prompt", "new_value"]
 
-            try:
-                value = get_llm_response_azure(prompt_text, context)
-                value = str(value).strip()
-                if value:
-                    ws.cell(row=cell_old.row, column=5, value=value)  # write to E
-            except Exception:
-                # On failure, leave existing E as-is
-                pass
+        for row in reader:
+            # Ensure all required columns exist in parsed row
+            data = [row.get(col, "").strip() for col in required_cols]
+            ws.append(data)
 
         # Save to a temp file and return its path
         tmpdir = tempfile.mkdtemp()
-        out_path = os.path.join(tmpdir, "variables_prefilled_last_year.xlsx")
+        out_path = os.path.join(tmpdir, "variables_prefilled.xlsx")
         wb.save(out_path)
         return out_path
-    except Exception:
+
+    except Exception as e:
+        print(f"Error in _prefill_last_year_from_prompts: {e}")
         return None
 
+def generate_doc_from_excel_map(file_map, context: str = ""):
+    """
+    Inputs:
+      file_map = {"excel": <path|file-like>, "template": <path|file-like>, ...}
+    Behavior:
+      - Read Excel with columns: placeholder_name, old_value, prompt, new_value
+      - Build replacements = {old_value -> new_value} (non-empty on both)
+      - Apply replacements to DOCX template; else build fallback
+      - Return (doc_path, filled_excel_path)
+    """
+
+    # --- load workbook or create blank with headers ---
+    def _load_wb(x):
+        try:
+            if isinstance(x, str) and os.path.exists(x):  # path
+                return openpyxl.load_workbook(x)
+            if hasattr(x, "read"):                        # file-like
+                b = x.read()
+                try: x.seek(0)
+                except Exception: pass
+                return openpyxl.load_workbook(io.BytesIO(b))
+        except Exception:
+            pass
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["placeholder_name", "old_value", "prompt", "new_value"])
+        return wb
+
+    wb = _load_wb(file_map.get("excel"))
+    ws = wb.active
+
+    # --- header map (fallback to A..D) ---
+    try:
+        hdr = [str(c.value).strip().lower() if c.value else "" for c in ws[1]]
+    except Exception:
+        hdr = []
+    def col(name, default_idx): 
+        return (hdr.index(name)+1) if name in hdr else default_idx
+    c_old, c_new = col("old_value", 2), col("new_value", 4)
+
+    # --- build replacements (keep order of appearance) ---
+    repl = OrderedDict()
+    for r in range(2, ws.max_row+1):
+        old_s = (str(ws.cell(r, c_old).value).strip() if ws.cell(r, c_old).value else "")
+        new_s = (str(ws.cell(r, c_new).value).strip() if ws.cell(r, c_new).value else "")
+        if old_s and new_s and old_s != new_s:
+            repl[old_s] = new_s
+
+    # --- save a temp copy of the excel ---
+    tmpdir = tempfile.mkdtemp()
+    filled_excel_path = os.path.join(tmpdir, "variables_filled.xlsx")
+    try: wb.save(filled_excel_path)
+    except Exception: filled_excel_path = None
+
+    # --- try to render DOCX with replacements; fallback if needed ---
+    template = file_map.get("template")
+    try:
+        doc = Document(template) if template else None
+    except Exception:
+        doc = None
+
+    if doc:
+        if 'replace_first_page_placeholders_docx' in globals(): replace_first_page_placeholders_docx(doc, repl)
+        if 'replace_placeholders_docx' in globals():            replace_placeholders_docx(doc, repl)
+        out = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
+        doc.save(out.name)
+        return out.name, filled_excel_path
+
+    if '_build_fallback_docx' in globals():
+        return _build_fallback_docx(repl, context), filled_excel_path
+
+    # ultra-simple fallback
+    doc = Document(); doc.add_heading("Generated Document (Fallback)", 1)
+    doc.add_paragraph("Template unavailable. Applied replacements:")
+    for k, v in repl.items(): doc.add_paragraph(f"{k} → {v}")
+    out = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
+    doc.save(out.name)
+    return out.name, filled_excel_path
 
 def replace_first_slide_placeholders_pptx(prs: Presentation, replacements: dict):
     """Replace placeholders on the first slide ONLY."""
@@ -421,6 +575,83 @@ def _build_fallback_docx(replacements: dict, context: str) -> str:
     doc.save(out.name)
     return out.name
 
+def load_template(template_file) -> str:
+    """
+    Extract plain text from a DOCX template file.
+    Returns a single string with paragraphs separated by newlines.
+    """
+    if not template_file:
+        return ""
+
+    try:
+        doc = Document(template_file)
+        paragraphs = []
+        for para in doc.paragraphs:
+            text = para.text.strip()
+            if text:
+                paragraphs.append(text)
+        return "\n".join(paragraphs)
+    except Exception as e:
+        print(f"Error loading template: {e}")
+        return ""
+
+
+def find_relevant_variables(files: dict):
+    guidelines = files.get("guidelines") if files else None
+    transcript = files.get("transcript") if files else None
+    pdf = files.get("pdf") if files else None
+    excel = files.get("excel") if files else None
+    template = files.get("template") if files else None
+
+    # Build context
+    ctx = ""
+    ctx += load_guidelines(guidelines)
+    tr_text = load_transcript(transcript)
+    if tr_text:
+        ctx += ("\n\n" if ctx else "") + tr_text
+    pdf_text = load_pdf(pdf)
+    if pdf_text:
+        ctx += ("\n\n" if ctx else "") + pdf_text
+    
+    template_text = load_template(template) if template else None
+    if template_text:
+        ctx += ("\n\n" if ctx else "") + template_text
+    
+    # NEW: optionally pre-fill Column E based on prompts in Column D
+    excel_for_processing = excel
+    maybe_prefilled_path = _prefill_last_year_from_prompts(excel, ctx)
+    if maybe_prefilled_path:
+        excel_for_processing = maybe_prefilled_path  # use the updated workbook
+    # Build replacements dict (and annotate Excel with generated values if present)
+    replacements, filled_excel_path = load_and_annotate_replacements(excel_for_processing, ctx) if excel_for_processing else ({}, None)
+    doc_path = _build_fallback_docx(replacements, ctx)
+    return (doc_path, filled_excel_path)
+
+def fill_section_values(files):
+    guidelines = files.get("guidelines") if files else None
+    transcript = files.get("transcript") if files else None
+    pdf = files.get("pdf") if files else None
+    excel = files.get("excel") if files else None
+    template = files.get("template") if files else None
+    # Build context
+    ctx = ""
+    ctx += load_guidelines(guidelines)
+    tr_text = load_transcript(transcript)
+    if tr_text:
+        ctx += ("\n\n" if ctx else "") + tr_text
+    pdf_text = load_pdf(pdf)
+    if pdf_text:
+        ctx += ("\n\n" if ctx else "") + pdf_text
+    
+    template_text = load_template(template) if template else None
+    if template_text:
+        ctx += ("\n\n" if ctx else "") + template_text
+    
+    # NEW: optionally pre-fill Column E based on prompts in Column D
+    excel_for_processing = excel
+    print(excel_for_processing)
+    (rep, filled_path) = load_and_annotate_replacements(excel_for_processing, ctx)
+    return filled_path
 
 
 
@@ -445,14 +676,17 @@ def process_and_fill(files: dict, prefill_last_year: bool = False):
     pdf_text = load_pdf(pdf)
     if pdf_text:
         ctx += ("\n\n" if ctx else "") + pdf_text
-
+    
+    template_text = load_template(template) if template else None
+    if template_text:
+        ctx += ("\n\n" if ctx else "") + template_text
+    print("m: ", template)
+    
     # NEW: optionally pre-fill Column E based on prompts in Column D
     excel_for_processing = excel
-    if prefill_last_year and excel:
-        maybe_prefilled_path = _prefill_last_year_from_prompts(excel, ctx)
-        if maybe_prefilled_path:
-            excel_for_processing = maybe_prefilled_path  # use the updated workbook
-
+    maybe_prefilled_path = _prefill_last_year_from_prompts(excel, ctx)
+    if maybe_prefilled_path:
+        excel_for_processing = maybe_prefilled_path  # use the updated workbook
     # Build replacements dict (and annotate Excel with generated values if present)
     replacements, filled_excel_path = load_and_annotate_replacements(excel_for_processing, ctx) if excel_for_processing else ({}, None)
 
@@ -460,11 +694,12 @@ def process_and_fill(files: dict, prefill_last_year: bool = False):
     template_name = (getattr(template, "name", "") or "").lower()
     is_pptx = template_name.endswith(".pptx") if template else False
     is_docx = template_name.endswith(".docx") if template else False
-
     # If there's no template at all, produce a fallback DOCX
-    if not template:
-        doc_path = _build_fallback_docx(replacements, ctx)
-        return (doc_path, filled_excel_path)
+    # if not template:
+    #     doc_path = _build_fallback_docx(replacements, ctx)
+    #     return (doc_path, filled_excel_path)
+    doc_path = _build_fallback_docx(replacements, ctx)
+    return (doc_path, filled_excel_path)
 
     if is_pptx:
         try:
