@@ -21,11 +21,47 @@ import os, io, tempfile, openpyxl
 from collections import OrderedDict
 from docx import Document
 from typing import Tuple, Dict
+import json
+from typing import List, Dict
+import time
+from zipfile import ZipFile
+from lxml import etree
+from io import BytesIO
+from docx.oxml.ns import qn
+from docx.shared import RGBColor
+from zipfile import ZipFile
+from lxml import etree
+import re
 
 # ——— Azure OpenAI config ———
 # Expect these to be set by the Streamlit frontend via secrets or environment variables
 API_KEY = None  # to be set by frontend
 API_ENDPOINT = None  # to be set by frontend
+
+
+from pydantic import BaseModel, TypeAdapter
+class Row(BaseModel):
+    placeholder_name: str
+    old_value: str
+    prompt: str
+    new_value: str
+
+    # Pydantic v2 config
+    model_config = {
+        "extra": "forbid",   # reject unknown fields
+        "str_strip_whitespace": True
+    }
+
+# v2 parsing helpers
+_row_list_adapter = TypeAdapter(List[Row])
+
+def parse_rows_json(s: str) -> List[Row]:
+    # Accepts a JSON string; raises ValidationError on mismatch
+    return _row_list_adapter.validate_json(s)
+
+def row_to_dict(r: Row) -> dict:
+    return r.model_dump()
+
 
 
 def configure(api_key: str, api_endpoint: str):
@@ -55,6 +91,25 @@ def get_llm_response_azure(prompt: str, context: str) -> str:
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"].strip()
 
+def fill_excel_prompts(prompt: str, context: str, old_value: str, variable_name: str) -> str:
+    headers = {"Content-Type": "application/json", "api-key": API_KEY}
+    system_msg = (
+        "You are an expert on Transfer Pricing and financial analysis. "
+        "You are provided the old value of a variable, and the name of the variable."
+        "Update this value with the latest data and STAY AS CLOSE TO OLD VALUE AS POSSIBLE"
+        "Use either the internet or the context to infer the new value, and LEAVE IT THE SAME if it is not determinate. If you use the internet then cite sources. "
+    )
+    prompt = ("old_value: {old_value}"
+              "variable_name: {variable_name}\n\n"
+              "Prompt: " + prompt + 
+              "Context: \n") + context
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content":  context + prompt}
+    ]
+    resp = requests.post(API_ENDPOINT, headers=headers, json={"messages": messages})
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"].strip()
 
 # ---------------------
 # Safe loader helpers
@@ -131,6 +186,7 @@ def load_and_annotate_replacements(excel_file, context: str) -> Tuple[Dict[str, 
         ws.append(["placeholder_name", "old_value", "prompt", "new_value"])
 
     # --- Resolve column indices based on headers (row 1), fallback to A..D ---
+    # print("p", wb["prompt"])
     header_map = {}
     try:
         headers = [str(c.value).strip().lower() if c.value is not None else "" for c in ws[1]]
@@ -163,7 +219,7 @@ def load_and_annotate_replacements(excel_file, context: str) -> Tuple[Dict[str, 
             except Exception:
                 return ""
 
-        placeholder_name = _get(col_placeholder)
+        variable_name = _get(col_placeholder)
         old_value        = _get(col_old)
         prompt_text      = _get(col_prompt)
         new_value_curr   = _get(col_new)
@@ -171,7 +227,7 @@ def load_and_annotate_replacements(excel_file, context: str) -> Tuple[Dict[str, 
         # If prompt present, query LLM and write into new_value
         if prompt_text:
             try:
-                llm_out = get_llm_response_azure(prompt_text, context)
+                llm_out = fill_excel_prompts(prompt_text, context, old_value, variable_name)
                 llm_out = (llm_out or "").strip()
                 # Write to the cell even if empty (clears previous content if any)
                 ws.cell(row=r, column=col_new, value=llm_out)
@@ -207,16 +263,176 @@ def collapse_runs(paragraph):
     paragraph.add_run(text)
 
 
-def replace_in_paragraph(p, replacements):
-    collapse_runs(p)
+def replace_in_paragraph(p, replacements: dict):
+    """
+    Hybrid replacer (upgraded):
+      1) Concatenate all <w:t> texts.
+      2) Replace using a single regex alternation of unique keys (longest-first).
+         - Skips keys that appear >1 time in this paragraph (ambiguous here).
+      3) Write back across the SAME number of <w:t> nodes using original lengths.
+      4) Preserve spaces via xml:space="preserve".
+    """
+    if not replacements:
+        return
+
+    # ensure keys/values are strings
+    repl = {str(k): ("" if v is None else str(v)) for k, v in replacements.items()}
+
+    p_elm = p._p
+    ns = p_elm.nsmap or {
+        "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+        "xml": "http://www.w3.org/XML/1998/namespace",
+    }
+
+    t_nodes = p_elm.findall(".//w:t", namespaces=ns)
+    if not t_nodes:
+        return
+
+    originals = [(t, t.text or "") for t in t_nodes]
+    full = "".join(txt for _, txt in originals)
+    if not full:
+        return
+
+    # ---- Build a longest-first set of present, unique keys in THIS paragraph ----
+    keys = [k for k in repl.keys() if k and (k in full)]
+    if not keys:
+        return
+
+    # Prefer longest keys first to avoid partial overlaps
+    keys.sort(key=len, reverse=True)
+
+    # Enforce paragraph-level uniqueness (skip ambiguous keys here)
+    unique_keys = [k for k in keys if full.count(k) == 1]
+    if not unique_keys:
+        return  # nothing unambiguous in this paragraph
+
+    # Single-pass regex alternation
+    pattern = re.compile("|".join(re.escape(k) for k in unique_keys))
+    new_full, nsubs = pattern.subn(lambda m: repl[m.group(0)], full)
+
+    if nsubs == 0 or new_full == full:
+        return  # no change
+
+    # ---- Redistribute back using original lengths to keep run boundaries intact ----
+    lengths = [len(txt) for _, txt in originals]
+    pos = 0
+    n = len(originals)
+    for i in range(n):
+        t, _oldtxt = originals[i]
+        take = lengths[i] if i < n - 1 else max(0, len(new_full) - pos)
+        segment = new_full[pos:pos + take] if take >= 0 else ""
+        t.text = segment
+        pos += lengths[i] if i < n - 1 else len(new_full) - pos
+
+        # Preserve leading/trailing spaces for this text node
+        if segment and (segment[0].isspace() or segment[-1].isspace()):
+            t.set(qn("xml:space"), "preserve")
+
+    # Optional: cleanup formatting on runs that no longer contain placeholders
+    # _clear_red_on_non_placeholder_runs(p, repl)
+    # _clear_paragraph_bullet_color(p)
+
+
+def _clear_paragraph_bullet_color(p):
+    try:
+        if p.style and p.style.font and getattr(p.style.font, "color", None):
+            p.style.font.color.rgb = None
+            p.style.font.color.theme_color = None
+    except Exception:
+        pass
+
+def _run_is_explicit_red(run) -> bool:
+    c = getattr(run.font, "color", None)
+    if not c or getattr(c, "rgb", None) is None:
+        return False
+    try:
+        r, g, b = c.rgb[0], c.rgb[1], c.rgb[2]
+        return (200 <= r <= 255 and 0 <= g <= 80 and 0 <= b <= 80) or (r >= 100 and b <=20 and g <=20)
+    except Exception:
+        return False
+
+def _clear_run_color(run):
+    if getattr(run.font, "color", None):
+        try:
+            run.font.color.rgb = None
+        except Exception:
+            pass
+        try:
+            run.font.color.theme_color = None
+        except Exception:
+            pass
+
+def _clear_red_on_non_placeholder_runs(p, replacements: dict):
+    keys = list(replacements.keys())
     for run in p.runs:
-        for ph, val in replacements.items():
-            if ph in run.text:
-                run.text = run.text.replace(ph, val)
+        text = run.text or ""
+        if not text:
+            continue
+        # If this run used to be a placeholder (red), but now has no placeholders, clear color
+        if _run_is_explicit_red(run):
+            if (not any(k in text for k in keys)) and ("{{" not in text and "}}" not in text):
+                _clear_run_color(run)
+
+
+
+
+def _rewrite_footnotes_xml_bytes(docx_bytes: bytes, replacements: dict) -> bytes:
+    """
+    Open a .docx (zip) from bytes, replace placeholders inside word/footnotes.xml,
+    and return new .docx bytes. If footnotes.xml is missing, return the original bytes.
+    """
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    with ZipFile(BytesIO(docx_bytes)) as zin:
+        names = {i.filename for i in zin.infolist()}
+        if "word/footnotes.xml" not in names:
+            return docx_bytes  # no footnotes part
+
+        # Read and parse original footnotes.xml
+        foot_xml = zin.read("word/footnotes.xml")
+        root = etree.fromstring(foot_xml)
+
+        # Replace inside every w:t under w:footnote
+        # (Note: this is robust for tokens contained in a single text node.
+        # If your placeholders can split across runs, prefer the python-docx path.)
+        for t in root.findall(".//w:footnote//w:t", namespaces=ns):
+            if t.text:
+                new_text = t.text
+                for ph, val in replacements.items():
+                    if ph in new_text:
+                        new_text = new_text.replace(ph, val)
+                if new_text != t.text:
+                    t.text = new_text
+
+        # Build a new .docx with modified footnotes.xml
+        out_buf = BytesIO()
+        with ZipFile(out_buf, "w") as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                if item.filename == "word/footnotes.xml":
+                    data = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone="yes")
+                zout.writestr(item, data)
+        return out_buf.getvalue()
+
+
+def _apply_footnotes_xml_fallback_in_place(docx_path: str, replacements: dict) -> None:
+    """
+    Read a saved .docx from disk, run the XML fallback, and overwrite it in place.
+    Safe no-op if the document has no footnotes.xml.
+    """
+    try:
+        with open(docx_path, "rb") as f:
+            original = f.read()
+        updated = _rewrite_footnotes_xml_bytes(original, replacements)
+        if updated != original:
+            with open(docx_path, "wb") as f:
+                f.write(updated)
+    except Exception:
+        # Be defensive: never fail the whole pipeline if footnote rewrite trips.
+        pass
 
 
 def replace_placeholders_docx(doc: Document, replacements: dict):
-    """Replace placeholders AFTER the first page break (mirrors your original behavior)."""
+    """Replace placeholders AFTER the first page break, preserving images and footnotes."""
     from docx.oxml.ns import qn
     seen = False
     br_tag = qn('w:br')
@@ -232,11 +448,15 @@ def replace_placeholders_docx(doc: Document, replacements: dict):
             if not seen:
                 continue
         replace_in_paragraph(p, replacements)
+
+    # Tables
     for tbl in doc.tables:
         for row in tbl.rows:
             for cell in row.cells:
                 for p in cell.paragraphs:
                     replace_in_paragraph(p, replacements)
+
+    # Headers/footers
     for sec in doc.sections:
         if sec.header:
             for p in sec.header.paragraphs:
@@ -244,6 +464,8 @@ def replace_placeholders_docx(doc: Document, replacements: dict):
         if sec.footer:
             for p in sec.footer.paragraphs:
                 replace_in_paragraph(p, replacements)
+
+    # Footnotes (if present)
 
 
 def replace_first_page_placeholders_docx(doc: Document, replacements: dict):
@@ -264,128 +486,139 @@ def replace_first_page_placeholders_docx(doc: Document, replacements: dict):
         if seen:
             break
 
+_BOUND = set("\n\r\t,.;:()[]{}<>—–-•|")
 
-# =========================
-# PPTX (new) helpers
-# =========================
+def _first_occurrence_span(haystack: str, needle: str) -> Tuple[int, int]:
+    i = haystack.find(needle)
+    return (i, i + len(needle)) if i != -1 else (-1, -1)
 
-def _pptx_replace_text_in_paragraph(paragraph, replacements: dict):
-    """Collapse runs then perform in-place string replacements."""
-    full = "".join(run.text for run in paragraph.runs) if getattr(paragraph, "runs", None) else getattr(paragraph, "text", "")
-    for ph, val in replacements.items():
-        if ph in full:
-            full = full.replace(ph, val)
-    paragraph.text = full
+def make_unique_span(context: str, core: str, max_expand: int = 120) -> Tuple[str, Tuple[int,int]]:
+    """
+    Returns (unique_span, (L, R)). If core not found, returns ("", (0,0)).
+    Expands to nearest punctuation/newline boundaries until unique or limit hit.
+    """
+    core = (core or "").strip()
+    if not core:
+        return "", (0, 0)
+
+    if context.count(core) == 1:
+        s, e = _first_occurrence_span(context, core)
+        return context[s:e], (s, e)
+
+    s, e = _first_occurrence_span(context, core)
+    if s == -1:
+        return "", (0, 0)
+
+    L, R = s, e
+    expanded = 0
+    while expanded < max_expand and context.count(context[L:R]) != 1:
+        # expand left to previous boundary
+        l = L
+        while l > 0 and context[l-1] not in _BOUND:
+            l -= 1
+        if l == L and L > 0:  # no boundary nearby, nudge
+            l = max(0, L - 8)
+        L = l
+
+        if context.count(context[L:R]) == 1:
+            break
+
+        # expand right to next boundary
+        r = R
+        while r < len(context) and context[r] not in _BOUND:
+            r += 1
+        if r == R and R < len(context):  # no boundary nearby, nudge
+            r = min(len(context), R + 8)
+        R = r
+
+        expanded = (s - L) + (R - e)
+
+    span = context[L:R]
+    return (span if span and context.count(span) == 1 else ""), (L, R)
 
 
-def _pptx_replace_in_text_frame(text_frame, replacements: dict):
-    if not text_frame:
-        return
-    for para in text_frame.paragraphs:
-        _pptx_replace_text_in_paragraph(para, replacements)
 
-
-def _pptx_replace_in_table(table, replacements: dict):
-    if not table:
-        return
-    for row in table.rows:
-        for cell in row.cells:
-            if getattr(cell, "text_frame", None):
-                _pptx_replace_in_text_frame(cell.text_frame, replacements)
-
-
-def _pptx_replace_in_shape(shape, replacements: dict):
-    # Text boxes and placeholders
-    if getattr(shape, "has_text_frame", False) and getattr(shape, "text_frame", None):
-        _pptx_replace_in_text_frame(shape.text_frame, replacements)
-
-    # Tables
-    if getattr(shape, "has_table", False) and getattr(shape, "table", None):
-        _pptx_replace_in_table(shape.table, replacements)
-
-    # Charts (replace in chart title if present)
-    # IMPORTANT: never touch shape.chart unless shape.has_chart is True,
-    # because accessing .chart on non-chart shapes raises:
-    #   ValueError: shape does not contain a chart
-    if getattr(shape, "has_chart", False):
-        try:
-            chart = shape.chart
-            if getattr(chart, "has_title", False):
-                _pptx_replace_in_text_frame(chart.chart_title.text_frame, replacements)
-        except Exception:
-            # Be defensive; skip any chart we can't access
-            pass
-
-    # Grouped shapes — recurse
-    if getattr(shape, "shape_type", None) == MSO_SHAPE_TYPE.GROUP:
-        for sub in shape.shapes:
-            _pptx_replace_in_shape(sub, replacements)
-
-def ask_variable_list(context: str) -> str:
-    headers = {"Content-Type": "application/json", "api-key": API_KEY}
-    CHANGE_PLAN_PROMPT = """
-    You are a meticulous placeholder auditor for corporate documents (transfer pricing + finance context).
-
-    GOAL
-    From the provided company data ("CONTEXT"), output a clean, machine-readable table of everything that must be updated in the document/template.
-
-    TABLE SCHEMA (CSV, no markdown, include header)
-    placeholder_name,old_value,prompt,new_value
-
-    DEFINITIONS
-    - A placeholder can refer to: a word, number, date, name, paragraph, or a whole section.
-    - "old_value" = the value currently implied by CONTEXT (e.g., last year’s value, outdated name/date, prior transaction figure).
-    - "new_value" = the updated value you can infer from CONTEXT with high confidence.
-    - "prompt" = ONLY used when the placeholder refers to a whole section that needs rewriting. In that case, write a clear instruction another LLM can use to generate the section (reference the concrete facts available in CONTEXT). For non-section placeholders, leave "prompt" blank.
-
-    RULES
-    1) Output ONLY CSV with the exact header:
-    placeholder_name,old_value,prompt,new_value
-    No commentary, no extra columns, no markdown.
-    2) If you are NOT ≥80% confident about the correct new value, leave new_value empty.
-    3) Keep values terse and precise (no vague phrases like “appears to be”).
-    4) Prefer exact spans from CONTEXT for old_value and new_value when possible.
-    5) Identify changes including (but not limited to):
-    - Company/Group/Entity names; addresses; legal identifiers
-    - Fiscal years, dates, periods (e.g., 2023 → 2024)
-    - Financials (revenue, EBIT, margins, headcount, transaction values)
-    - Functions, assets, risks; intercompany transactions; counterparties
-    - Benchmarks/comparables references
-    - Governance/personnel changes (roles, titles)
-    - Jurisdictions, regulations, citations that changed
-    - Any section that must be rewritten due to updated facts
-    6) For SECTION-LEVEL placeholders, set placeholder_name to a clear label (e.g., SECTION:Functional Analysis),
-    old_value to a short excerpt/summary of the current stance, prompt to a concrete writing instruction,
-    and new_value empty (the other LLM will fill it).
-    7) Limit each cell to essential text. Avoid line breaks in cells. Escape commas with quotes if needed.
-
-    CONTEXT
-    <<<CONTEXT_START
-    {context}
-    CONTEXT_END>>>
-
-    TASK
-    Produce the CSV now.
+def ask_variable_list(context: str, wait_seconds: float = 2.0):
+    """
+    Keep calling the LLM until it returns valid JSON (parsed as List[Row]).
+    Blocks indefinitely until success. Returns List[Row].
     """
 
+    headers = {"Content-Type": "application/json", "api-key": API_KEY}
+
     system_msg = (
-        "You are a precise placeholder auditor that emits ONLY compact CSV suitable for direct ingestion. "
-        "Do not use markdown, bullets, or explanations. Keep outputs concise and never vague."
+    "You output ONLY JSON: an array of objects with exactly these keys: "
+    "placeholder_name, old_value, prompt, new_value. No prose/markdown. "
+    "Never output any object where a value equals its key name "
+    '(e.g., "old_value":"old_value"). If you cannot find valid rows, return [].'
     )
 
-    # If you keep `prompt` external, pass CHANGE_PLAN_PROMPT and format {context} beforehand.
-    # Here we always append the contextualized prompt after the system message.
-    messages = [
-        {"role": "system", "content": system_msg},
-        {
-            "role": "user",
-            "content": CHANGE_PLAN_PROMPT.format(context=context)  # expects {context} in the prompt
-        },
-    ]
-    resp = requests.post(API_ENDPOINT, headers=headers, json={"messages": messages})
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"].strip()
+    user_prompt = f"""
+You are a meticulous placeholder auditor for corporate documents (transfer pricing + finance context).
 
+OUTPUT
+Return ONLY a JSON array. Each element must have exactly:
+- "placeholder_name": string (for section-level use "SECTION:<name>")
+- "old_value": string
+- "prompt": string (non-empty ONLY if the placeholder is a whole section needing rewrite; otherwise "")
+- "new_value": string (empty if <80% confident)
+
+RULES
+- No markdown, no comments, no code fences—JSON array only.
+- Keep strings terse; prefer exact spans from CONTEXT.
+- Identify changes in names/addresses/IDs; dates/fiscal years; financials; FAR; intercompany; benchmarks; governance; jurisdictions/regulations; and any sections to be rewritten.
+- **old_value must be an exact substring of CONTEXT that is unique (occurs once).**
+- **If a bare value would occur multiple times, expand old_value by including adjacent label/unit/words from CONTEXT until the span is unique (e.g., prefer 'employees: 14 FTEs' over '14').**
+- **Do not invent header/example rows; do not use key names as values.**
+- **For non-section placeholders, prompt must be empty (''); for SECTION:<name> rows, prompt must be non-empty.**
+- **Deduplicate: do not output multiple rows with the same (placeholder_name, old_value).**
+
+CONTEXT
+<<<CONTEXT_START
+{context}
+CONTEXT_END>>>
+""".strip()
+
+    while True:  # retry forever
+        try:
+            payload = {
+                "messages": [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0,
+                "top_p": 1,
+                "seed": 7,  # ignored if unsupported
+            }
+            resp = requests.post(API_ENDPOINT, headers=headers, json=payload, timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
+
+            text = (
+                data.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                    .strip()
+            )
+
+            rows = parse_rows_json(text)
+            print(text)
+
+            # Normalize: if a non-section has a non-empty prompt, blank it.
+            for r in rows:
+                if len(r.new_value) <1:
+                    r.new_value = r.old_value
+                if len(r.prompt) < 1:
+                    r.prompt = ""
+            # for r in rows:
+            #     if not r.placeholder_name.startswith("SECTION:") and r.prompt:
+            #         r.prompt = ""
+
+            return rows  # success → exit loop
+
+        except Exception as e:
+            print(f"[ask_variable_list] Retry due to invalid model response: {e}")
+            time.sleep(wait_seconds)
 
 
 
@@ -400,7 +633,6 @@ def _prefill_last_year_from_prompts(excel_file, context: str) -> str | None:
     or None on error.
     """
     try:
-        # Try to load the Excel, otherwise create a new workbook with required columns
         try:
             wb = openpyxl.load_workbook(excel_file)
             ws = wb.active
@@ -408,23 +640,29 @@ def _prefill_last_year_from_prompts(excel_file, context: str) -> str | None:
             wb = openpyxl.Workbook()
             ws = wb.active
             ws.title = "variables"
-            ws.append(["placeholder_name", "old_value", "prompt", "new_value"])
 
-        # Get CSV from the LLM
-        csv_output = ask_variable_list(context)
-        if not csv_output:
-            return None
-
-        # Parse CSV safely
-        reader = csv.DictReader(StringIO(csv_output))
         required_cols = ["placeholder_name", "old_value", "prompt", "new_value"]
 
-        for row in reader:
-            # Ensure all required columns exist in parsed row
-            data = [row.get(col, "").strip() for col in required_cols]
-            ws.append(data)
+        # --- Force header to row 1 ---
+        current_header = [ws.cell(row=1, column=i).value for i in range(1, len(required_cols)+1)]
+        if current_header != required_cols:
+            # overwrite row 1 explicitly
+            for i, col in enumerate(required_cols, start=1):
+                ws.cell(row=1, column=i, value=col)
 
-        # Save to a temp file and return its path
+        # --- Get rows from LLM (list of row objects) ---
+        rows = ask_variable_list(context, 4)
+        if not rows:
+            return None  # your docstring promised None on error/empty
+
+        # --- Append rows after the last row ---
+        for r in rows:
+            ws.append([getattr(r, "placeholder_name", "") or "",
+                       getattr(r, "old_value", "") or "",
+                       getattr(r, "prompt", "") or "",
+                       getattr(r, "new_value", "") or ""])
+
+        # --- Save to a temp file ---
         tmpdir = tempfile.mkdtemp()
         out_path = os.path.join(tmpdir, "variables_prefilled.xlsx")
         wb.save(out_path)
@@ -433,7 +671,7 @@ def _prefill_last_year_from_prompts(excel_file, context: str) -> str | None:
     except Exception as e:
         print(f"Error in _prefill_last_year_from_prompts: {e}")
         return None
-
+    
 def generate_doc_from_excel_map(file_map, context: str = ""):
     """
     Inputs:
@@ -513,35 +751,6 @@ def generate_doc_from_excel_map(file_map, context: str = ""):
     doc.save(out.name)
     return out.name, filled_excel_path
 
-def replace_first_slide_placeholders_pptx(prs: Presentation, replacements: dict):
-    """Replace placeholders on the first slide ONLY."""
-    if not getattr(prs, "slides", None):
-        return
-    slide = prs.slides[0]
-    for shp in slide.shapes:
-        _pptx_replace_in_shape(shp, replacements)
-
-    # Notes (if present)
-    if getattr(slide, "has_notes_slide", False) and slide.has_notes_slide:
-        notes = slide.notes_slide
-        if hasattr(notes, "notes_text_frame") and notes.notes_text_frame is not None:
-            _pptx_replace_in_text_frame(notes.notes_text_frame, replacements)
-
-
-def replace_placeholders_pptx(prs: Presentation, replacements: dict, start_slide_index: int = 1):
-    """Replace placeholders on all slides starting from start_slide_index (default: after first slide)."""
-    for idx, slide in enumerate(prs.slides):
-        if idx < start_slide_index:
-            continue
-        for shp in slide.shapes:
-            _pptx_replace_in_shape(shp, replacements)
-
-        # Notes (if present)
-        if getattr(slide, "has_notes_slide", False) and slide.has_notes_slide:
-            notes = slide.notes_slide
-            if hasattr(notes, "notes_text_frame") and notes.notes_text_frame is not None:
-                _pptx_replace_in_text_frame(notes.notes_text_frame, replacements)
-
 
 # ---------------------
 # Fallback DOCX builder
@@ -577,20 +786,68 @@ def _build_fallback_docx(replacements: dict, context: str) -> str:
 
 def load_template(template_file) -> str:
     """
-    Extract plain text from a DOCX template file.
-    Returns a single string with paragraphs separated by newlines.
+    Extract plain text from a DOCX template file, including:
+      - headers (all sections)
+      - body paragraphs (incl. TOC paragraphs)
+      - tables (body + headers/footers)
+      - footers (all sections)
+    Returns a single string with items separated by newlines.
     """
     if not template_file:
         return ""
 
     try:
         doc = Document(template_file)
-        paragraphs = []
-        for para in doc.paragraphs:
-            text = para.text.strip()
-            if text:
-                paragraphs.append(text)
-        return "\n".join(paragraphs)
+        chunks = []
+        seen = set()  # avoid accidental duplicates if the same text is reachable twice
+
+        def add(text: str):
+            t = (text or "").strip()
+            if t and t not in seen:
+                chunks.append(t)
+                seen.add(t)
+
+        def add_paragraphs(paragraphs):
+            for p in paragraphs:
+                # include all body paragraphs; this already captures TOC text if present
+                add(p.text)
+
+        def add_tables(tables):
+            # Flatten table content row-by-row
+            for tbl in tables:
+                for row in tbl.rows:
+                    cells_txt = []
+                    for cell in row.cells:
+                        # cell.text returns the concatenated text of all paragraphs in the cell
+                        ct = (cell.text or "").strip()
+                        if ct:
+                            cells_txt.append(ct)
+                    if cells_txt:
+                        # Use a lightweight delimiter to keep context readable
+                        add(" | ".join(cells_txt))
+
+        # 1) Headers (per section)
+        for sec in doc.sections:
+            hdr = sec.header
+            if hdr:
+                add_paragraphs(hdr.paragraphs)
+                add_tables(hdr.tables)
+
+        # 2) Body paragraphs (this includes TOC content if the document has a generated TOC)
+        add_paragraphs(doc.paragraphs)
+
+        # 3) Body tables
+        add_tables(doc.tables)
+
+        # 4) Footers (per section)
+        for sec in doc.sections:
+            ftr = sec.footer
+            if ftr:
+                add_paragraphs(ftr.paragraphs)
+                add_tables(ftr.tables)
+
+        return "\n".join(chunks)
+
     except Exception as e:
         print(f"Error loading template: {e}")
         return ""
@@ -649,82 +906,5 @@ def fill_section_values(files):
     
     # NEW: optionally pre-fill Column E based on prompts in Column D
     excel_for_processing = excel
-    print(excel_for_processing)
     (rep, filled_path) = load_and_annotate_replacements(excel_for_processing, ctx)
     return filled_path
-
-
-
-def process_and_fill(files: dict, prefill_last_year: bool = False):
-    """
-    files: {...}
-    prefill_last_year: if True, pre-fill Column E using AI prompts in Column D before replacement.
-    """
-    # Defensive dict access
-    guidelines = files.get("guidelines") if files else None
-    transcript = files.get("transcript") if files else None
-    pdf = files.get("pdf") if files else None
-    excel = files.get("excel") if files else None
-    template = files.get("template") if files else None
-
-    # Build context
-    ctx = ""
-    ctx += load_guidelines(guidelines)
-    tr_text = load_transcript(transcript)
-    if tr_text:
-        ctx += ("\n\n" if ctx else "") + tr_text
-    pdf_text = load_pdf(pdf)
-    if pdf_text:
-        ctx += ("\n\n" if ctx else "") + pdf_text
-    
-    template_text = load_template(template) if template else None
-    if template_text:
-        ctx += ("\n\n" if ctx else "") + template_text
-    print("m: ", template)
-    
-    # NEW: optionally pre-fill Column E based on prompts in Column D
-    excel_for_processing = excel
-    maybe_prefilled_path = _prefill_last_year_from_prompts(excel, ctx)
-    if maybe_prefilled_path:
-        excel_for_processing = maybe_prefilled_path  # use the updated workbook
-    # Build replacements dict (and annotate Excel with generated values if present)
-    replacements, filled_excel_path = load_and_annotate_replacements(excel_for_processing, ctx) if excel_for_processing else ({}, None)
-
-    # Decide template type
-    template_name = (getattr(template, "name", "") or "").lower()
-    is_pptx = template_name.endswith(".pptx") if template else False
-    is_docx = template_name.endswith(".docx") if template else False
-    # If there's no template at all, produce a fallback DOCX
-    # if not template:
-    #     doc_path = _build_fallback_docx(replacements, ctx)
-    #     return (doc_path, filled_excel_path)
-    doc_path = _build_fallback_docx(replacements, ctx)
-    return (doc_path, filled_excel_path)
-
-    if is_pptx:
-        try:
-            prs = Presentation(template)
-        except Exception:
-            doc_path = _build_fallback_docx(replacements, ctx)
-            return (doc_path, filled_excel_path)
-        replace_first_slide_placeholders_pptx(prs, replacements)
-        replace_placeholders_pptx(prs, replacements, start_slide_index=1)
-        out = tempfile.NamedTemporaryFile(delete=False, suffix=".pptx")
-        prs.save(out.name)
-        return (out.name, filled_excel_path)
-
-    elif is_docx:
-        try:
-            doc = Document(template)
-        except Exception:
-            doc_path = _build_fallback_docx(replacements, ctx)
-            return (doc_path, filled_excel_path)
-        replace_first_page_placeholders_docx(doc, replacements)
-        replace_placeholders_docx(doc, replacements)
-        out = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
-        doc.save(out.name)
-        return (out.name, filled_excel_path)
-
-    else:
-        doc_path = _build_fallback_docx(replacements, ctx)
-        return (doc_path, filled_excel_path)
