@@ -16,8 +16,8 @@ st.title("Transfer Pricing Document Updater")
 
 st.download_button(
     "Download variables excel",
-    data = open("RSM NL - TP Agent 2 Yearly Update Variables - 18.09.2025 V1.xlsx", "rb").read(),
-    file_name="RSM NL - TP Agent 2 Yearly Update Variables - 18.09.2025 V1.xlsx",
+    data = open("documents2/RSM NL - TP Agent 2 Yearly Update Variables - 18.09.2025 V1.xlsx", "rb").read(),
+    file_name="documents2/RSM NL - TP Agent 2 Yearly Update Variables - 18.09.2025 V1.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
 
