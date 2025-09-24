@@ -38,7 +38,6 @@ import re
 API_KEY = None  # to be set by frontend
 API_ENDPOINT = None  # to be set by frontend
 
-
 from pydantic import BaseModel, TypeAdapter
 class Row(BaseModel):
     placeholder_name: str

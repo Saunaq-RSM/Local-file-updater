@@ -55,10 +55,6 @@ prefill_last_year = st.checkbox(
 # Session state: outputs & dataframes
 if "generated" not in st.session_state:
     st.session_state.generated = None
-if "full_df" not in st.session_state:
-    st.session_state.full_df = None         # full sheet (all columns)
-if "view_df" not in st.session_state:
-    st.session_state.view_df = None         # only columns A, E, F
 if "filled_excel_path" not in st.session_state:
     st.session_state.filled_excel_path = None
 if "step2_ready" not in st.session_state:
@@ -124,32 +120,14 @@ with st.expander("Selected files"):
     st.write(f"- **variables** → {variables_file.name if variables_file else '(none)'}")
     st.write(f"- **template** → {template_file.name if template_file else '(none)'}")
 
-# Helper to pick the display columns (A,E,F) robustly
-def pick_view_columns(df: pd.DataFrame):
-    cols = list(df.columns)
-
-    def by_idx(i, default=None):
-        return cols[i] if i < len(cols) else default
-
-    # Try name-based first, then fall back to positional (A=0, E=4, F=5)
-    col_A = next((c for c in cols if str(c).strip().lower() in {"variable_name","variable name","variable","name"}), by_idx(0))
-    col_E = next((c for c in cols if "last" in str(c).lower() and "year" in str(c).lower()), by_idx(4))
-    col_F = next((c for c in cols if "this" in str(c).lower() and "year" in str(c).lower()), by_idx(5))
-
-    # Filter out Nones / duplicates while preserving order
-    ordered = []
-    for c in [col_A, col_E, col_F]:
-        if c is not None and c in cols and c not in ordered:
-            ordered.append(c)
-    return ordered
 
 def run_step1_fill_and_preview():
     with st.spinner("Preparing variables…"):
         try:
-            # If we already have a sheet in memory, keep it (user may be returning from Step 2)
-            if st.session_state.sheet_df is not None:
-                st.success("Variables loaded from current session. Edit below.")
-                return
+            # Clear downstream state so it always reflects the latest Step 1 output
+            st.session_state.generated = None
+            st.session_state.step2_ready = False
+            st.session_state.section_excel_path = None
 
             file_map_preview = dict(base_file_map)
             result = find_relevant_variables(file_map_preview)
@@ -159,8 +137,8 @@ def run_step1_fill_and_preview():
                 return
 
             df = pd.read_excel(excel_path, engine="openpyxl")
-            _set_sheet(df)
-            st.success("Variables filled. Edit below.")
+            _set_sheet(df)  # <- overwrites session_state.sheet_df and sheet_path
+            st.success("Variables filled from the latest run. Edit below.")
 
         except Exception as e:
             st.error(f"Error in Step 1: {e}")
