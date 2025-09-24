@@ -25,16 +25,14 @@ st.info(
     """
 **How this tool works**
 
-1. Update your **Variables (.xlsx)**:
-   - **Last year value (Col E)** will be **replaced by This year value (Col F)**.
-   - If you want the AI to suggest **This year value**, write guidance in **AI prompt (Col D)**.  
-     When **Col F** is empty and **Col D** has a prompt, the AI will read your uploaded files and propose a value.
 
-2. Upload your files below — **Variables** and **Template** are required; the others are optional.
+1. Upload your files below — Only *Last year local file* is mandatory to upload.
 
-3. Click **Step 1 – Fill & preview variables**. Review/edit the table (we only show columns A, E, F).
+2. Click **Step 1 – Fill & preview variables**. Review/edit the table, Make sure the old values are unique in the text and replacable. Rerunning will rewrite the old table
 
-4. Click **Step 2 – Generate final document** to produce the DOCX/PPTX using your edited values.
+3. Click **Step 2 – Fill Section Variables**. This will answer any prompts you put in the prompts column of the table from the first step. 
+
+4. Click **Step 3 – Generate final document** to produce the DOCX/PPTX using your edited values.
 """
 )
 
@@ -46,11 +44,6 @@ variables_file  = st.file_uploader("Variables (.xlsx) — REQUIRED", type=["xlsx
 template_file   = st.file_uploader("Last year local file (.pptx/.docx) — REQUIRED for Step 2", type=["pptx", "docx"], key="u_template")
 
 # Prefill option (Boolean)
-prefill_last_year = st.checkbox(
-    "AI prefill last-year values (fill Column E using prompts in Column D)",
-    value=False,
-    help="If enabled, the app first asks the AI to fill Column E based on Column D, then performs replacements."
-)
 
 # Session state: outputs & dataframes
 if "generated" not in st.session_state:
