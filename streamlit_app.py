@@ -67,6 +67,9 @@ if "sheet_path" not in st.session_state:
     st.session_state.sheet_path = None
 if "generated" not in st.session_state:
     st.session_state.generated = None
+    
+# Keep editor widget state and script state in sync at the start of each run
+
 
 # Helper: write DF to a Windows-safe temp file and return the PATH
 def _df_to_temp_xlsx_path(df: pd.DataFrame) -> str:
@@ -103,6 +106,12 @@ def _download_current_sheet(label="Download current variables.xlsx", key="dl_cur
         key=key,
         use_container_width=True,
     )
+    
+def _persist_editor_from_state():
+    if "editor_sheet" in st.session_state:
+        _set_sheet(st.session_state.editor_sheet)
+
+# _persist_editor_from_state()
 
 # Build the file_map used by the backend; pass None for missing optionals
 base_file_map = {
@@ -119,7 +128,6 @@ with st.expander("Selected files"):
     st.write(f"- **analysis** → {analysis_file.name if analysis_file else '(none)'}")
     st.write(f"- **variables** → {variables_file.name if variables_file else '(none)'}")
     st.write(f"- **template** → {template_file.name if template_file else '(none)'}")
-
 
 def run_step1_fill_and_preview():
     with st.spinner("Preparing variables…"):
@@ -143,23 +151,6 @@ def run_step1_fill_and_preview():
         except Exception as e:
             st.error(f"Error in Step 1: {e}")
 
-st.button("Step 1 – Fill & preview variables", on_click=run_step1_fill_and_preview)
-
-# Single editor (always edits the global sheet)
-if st.session_state.sheet_df is not None:
-    st.subheader("Edit variables (live)")
-    edited_df = st.data_editor(
-        st.session_state.sheet_df,
-        key="editor_sheet",
-        use_container_width=True,
-        hide_index=True,
-        num_rows="dynamic",
-    )
-    # Persist edits and refresh saved path
-    _set_sheet(edited_df)
-
-    # Download the exact sheet that will be used by Step 2/3
-    _download_current_sheet()
 
 # ---------------- STEP 2 ----------------
 def run_step2_fill_sections():
@@ -183,9 +174,6 @@ def run_step2_fill_sections():
 
         except Exception as e:
             st.error(f"Error in Step 2: {e}")
-
-st.button("Step 2 – Fill section values", on_click=run_step2_fill_sections)
-
 # If a sheet exists, we already show the editor above and auto-persist + download button
 
 # ---------------- STEP 3 ----------------
@@ -239,7 +227,41 @@ def run_step3_generate():
             st.session_state.generated = None
             st.error(f"Error in Step 3: {e}")
 
-st.button("Step 3 – Generate final document", on_click=run_step3_generate)
+# ---------------- Buttons (inline, no on_click) ----------------
+st.divider()
+col1, col2, col3 = st.columns(3)
+with col1:
+    if st.button("Step 1 – Fill & preview variables"):
+        run_step1_fill_and_preview()
+with col2:
+    if st.button("Step 2 – Fill section values"):
+        run_step2_fill_sections()
+with col3:
+    if st.button("Step 3 – Generate final document"):
+        run_step3_generate()
+
+if st.session_state.sheet_df is not None:
+    st.subheader("Edit variables (live)")
+
+    # Render the editor with the current df
+    edited_df = st.data_editor(
+        st.session_state.sheet_df,
+        key="editor_sheet",          # keep the key if you want, but don't read it from session_state
+        use_container_width=True,
+        hide_index=True,
+        num_rows="dynamic",
+    )
+
+    # If the user made a change, persist it and immediately re-run so the editor shows the new base df
+    try:
+        changed = not st.session_state.sheet_df.equals(edited_df)
+    except Exception:
+        # equals() can raise if dtypes changed; fall back to a safer check
+        changed = True
+
+    if changed:
+        _set_sheet(edited_df)   # persists to st.session_state.sheet_df + temp path
+        st.rerun()              # refresh now so the UI reflects the new base data this run
 
 # Downloads
 gen = st.session_state.generated
