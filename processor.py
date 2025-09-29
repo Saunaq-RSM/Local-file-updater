@@ -161,18 +161,8 @@ def load_guidelines(file) -> str:
 
 def load_and_annotate_replacements(excel_file, context: str) -> Tuple[Dict[str, str], str | None]:
     """
-    New behavior for 4-column sheet:
-      Columns (A..D): placeholder_name, old_value, prompt, new_value
-
-      - If 'prompt' is not empty, query LLM via get_llm_response_azure(prompt, context)
-        and write the response into 'new_value' (D).
-      - Build replacements_dict as: { old_value -> new_value } for rows that have a non-empty new_value.
-
-    Returns:
-      (replacements_dict, filled_excel_path)
-        - replacements_dict: { old_value -> new_value } (only rows with non-empty new_value)
-        - filled_excel_path: absolute path to a temp 'variables_filled.xlsx' copy
-                             (a valid path even if workbook was created blank)
+    Loads or creates workbook and for each row with a prompt calls the LLM
+    to fill new_value. Avoids returning duplicate replacement keys.
     """
     # --- Try to load the workbook; if it fails, create a blank one with headers ---
     try:
@@ -185,8 +175,6 @@ def load_and_annotate_replacements(excel_file, context: str) -> Tuple[Dict[str, 
         ws.append(["placeholder_name", "old_value", "prompt", "new_value"])
 
     # --- Resolve column indices based on headers (row 1), fallback to A..D ---
-    # print("p", wb["prompt"])
-    header_map = {}
     try:
         headers = [str(c.value).strip().lower() if c.value is not None else "" for c in ws[1]]
     except Exception:
@@ -223,21 +211,24 @@ def load_and_annotate_replacements(excel_file, context: str) -> Tuple[Dict[str, 
         prompt_text      = _get(col_prompt)
         new_value_curr   = _get(col_new)
 
-        # If prompt present, query LLM and write into new_value
+        # If prompt present, query LLM and write into new_value (only overwrite if result non-empty)
         if prompt_text:
             try:
                 llm_out = fill_excel_prompts(prompt_text, context, old_value, variable_name)
                 llm_out = (llm_out or "").strip()
-                # Write to the cell even if empty (clears previous content if any)
-                ws.cell(row=r, column=col_new, value=llm_out)
-                new_value_curr = llm_out
+                # Only write back if LLM gave a non-empty answer (avoid erasing manual values)
+                if llm_out:
+                    ws.cell(row=r, column=col_new, value=llm_out)
+                    new_value_curr = llm_out
             except Exception:
                 # On error, leave whatever was already in new_value
                 pass
 
-        # Build replacements only when new_value is non-empty
-        if old_value and new_value_curr:
-            replacements[old_value] = new_value_curr
+        # Build replacements only when new_value is non-empty and different from old_value
+        if old_value and new_value_curr and old_value != new_value_curr:
+            # Avoid collisions: prefer the first mapping (do not overwrite existing keys)
+            if old_value not in replacements:
+                replacements[old_value] = new_value_curr
 
     # --- Always create a downloadable temp copy named variables_filled.xlsx ---
     filled_excel_path = None
@@ -537,19 +528,19 @@ def make_unique_span(context: str, core: str, max_expand: int = 120) -> Tuple[st
 
 
 
-def ask_variable_list(context: str, wait_seconds: float = 2.0):
+def ask_variable_list(context: str, wait_seconds: float = 2.0, max_retries: int = 6):
     """
     Keep calling the LLM until it returns valid JSON (parsed as List[Row]).
-    Blocks indefinitely until success. Returns List[Row].
+    Stops after max_retries and raises an exception if still invalid.
+    Returns List[Row].
     """
-
     headers = {"Content-Type": "application/json", "api-key": API_KEY}
 
     system_msg = (
-    "You output ONLY JSON: an array of objects with exactly these keys: "
-    "placeholder_name, old_value, prompt, new_value. No prose/markdown. "
-    "Never output any object where a value equals its key name "
-    '(e.g., "old_value":"old_value"). If you cannot find valid rows, return [].'
+        "You output ONLY JSON: an array of objects with exactly these keys: "
+        "placeholder_name, old_value, prompt, new_value. No prose/markdown. "
+        "Never output any object where a value equals its key name "
+        '(e.g., "old_value":"old_value"). If you cannot find valid rows, return [].'
     )
 
     user_prompt = f"""
@@ -578,7 +569,11 @@ CONTEXT
 CONTEXT_END>>>
 """.strip()
 
-    while True:  # retry forever
+    attempt = 0
+    last_exception = None
+
+    while attempt < max_retries:
+        attempt += 1
         try:
             payload = {
                 "messages": [
@@ -601,24 +596,25 @@ CONTEXT_END>>>
             )
 
             rows = parse_rows_json(text)
-            print(text)
 
             # Normalize: if a non-section has a non-empty prompt, blank it.
             for r in rows:
-                if len(r.new_value) <1:
-                    r.new_value = r.old_value
-                if len(r.prompt) < 1:
+                # keep prior behavior but do not silently override new_value if empty here;
+                # let the caller handle defaults/overwrites.
+                if r.prompt is None:
                     r.prompt = ""
-            # for r in rows:
-            #     if not r.placeholder_name.startswith("SECTION:") and r.prompt:
-            #         r.prompt = ""
+                if r.new_value is None:
+                    r.new_value = ""
 
-            return rows  # success → exit loop
+            return rows  # success
 
         except Exception as e:
-            print(f"[ask_variable_list] Retry due to invalid model response: {e}")
+            last_exception = e
+            print(f"[ask_variable_list] attempt {attempt}/{max_retries} failed: {e}")
             time.sleep(wait_seconds)
 
+    # If we exhaust retries, raise to let caller decide how to proceed
+    raise RuntimeError(f"ask_variable_list failed after {max_retries} attempts: {last_exception}")
 
 
 def _prefill_last_year_from_prompts(excel_file, context: str) -> str | None:
@@ -626,10 +622,10 @@ def _prefill_last_year_from_prompts(excel_file, context: str) -> str | None:
     Creates/updates an Excel workbook of variables based on ask_variable_list(context).
     If excel_file cannot be loaded, a new workbook is created with columns:
     placeholder_name, old_value, prompt, new_value.
-    
-    The output of ask_variable_list(context) (CSV text) is parsed and rows are
-    added to this workbook. Returns a temp file path to the updated workbook,
-    or None on error.
+
+    This version avoids appending duplicate (placeholder_name, old_value) rows:
+    - If the same old_value already exists, update the existing row's prompt/new_value
+      instead of appending a duplicate.
     """
     try:
         try:
@@ -649,17 +645,46 @@ def _prefill_last_year_from_prompts(excel_file, context: str) -> str | None:
             for i, col in enumerate(required_cols, start=1):
                 ws.cell(row=1, column=i, value=col)
 
+        # Build a lookup of existing old_values -> row index (to avoid duplicates)
+        existing_old_to_row = {}
+        for r in range(2, ws.max_row + 1):
+            try:
+                ov = ws.cell(row=r, column=2).value  # default old_value is column 2 (B)
+                if ov is not None:
+                    existing_old_to_row[str(ov).strip()] = r
+            except Exception:
+                continue
+
         # --- Get rows from LLM (list of row objects) ---
         rows = ask_variable_list(context, 4)
-        if not rows:
-            return None  # your docstring promised None on error/empty
+        if rows is None:
+            return None
 
-        # --- Append rows after the last row ---
+        # --- Insert or update rows ---
         for r in rows:
-            ws.append([getattr(r, "placeholder_name", "") or "",
-                       getattr(r, "old_value", "") or "",
-                       getattr(r, "prompt", "") or "",
-                       getattr(r, "new_value", "") or ""])
+            placeholder_name = getattr(r, "placeholder_name", "") or ""
+            old_value = (getattr(r, "old_value", "") or "").strip()
+            prompt = getattr(r, "prompt", "") or ""
+            new_value = getattr(r, "new_value", "") or ""
+
+            if not old_value and not placeholder_name:
+                # ignore empty rows
+                continue
+
+            if old_value in existing_old_to_row:
+                # update existing row in place (columns A..D)
+                row_idx = existing_old_to_row[old_value]
+                ws.cell(row=row_idx, column=1, value=placeholder_name)
+                ws.cell(row=row_idx, column=2, value=old_value)
+                # Only overwrite prompt/new_value if not empty (so we don't unintentionally erase existing data)
+                if prompt:
+                    ws.cell(row=row_idx, column=3, value=prompt)
+                if new_value:
+                    ws.cell(row=row_idx, column=4, value=new_value)
+            else:
+                # append new row
+                ws.append([placeholder_name, old_value, prompt, new_value])
+                existing_old_to_row[old_value] = ws.max_row  # update map
 
         # --- Save to a temp file ---
         tmpdir = tempfile.mkdtemp()
