@@ -12,7 +12,7 @@ configure(
 )
 
 st.set_page_config(page_title="TP Template Updater", layout="wide")
-st.title("Transfer Pricing Document Updater")
+st.title("TP Agent 2 Yearly Update")
 
 st.download_button(
     "Download variables excel",
