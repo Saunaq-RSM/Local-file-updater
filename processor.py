@@ -1,25 +1,12 @@
 # processor.py (backend logic)
 
-import tempfile
 import requests
 from docx import Document
-import openpyxl
 import pdfplumber
 import pandas as pd
 # --- at top of file ---
-import os
-import tempfile
-import requests
-from pptx import Presentation
-from pptx.enum.shapes import MSO_SHAPE_TYPE
-import openpyxl
-import tempfile
-import os
-import csv
-from io import StringIO
 import os, io, tempfile, openpyxl
 from collections import OrderedDict
-from docx import Document
 from typing import Tuple, Dict
 import json
 from typing import List, Dict
@@ -29,8 +16,6 @@ from lxml import etree
 from io import BytesIO
 from docx.oxml.ns import qn
 from docx.shared import RGBColor
-from zipfile import ZipFile
-from lxml import etree
 import re
 
 # ——— Azure OpenAI config ———
@@ -69,26 +54,6 @@ def configure(api_key: str, api_endpoint: str):
     API_ENDPOINT = api_endpoint
 
 
-def get_llm_response_azure(prompt: str, context: str) -> str:
-    headers = {"Content-Type": "application/json", "api-key": API_KEY}
-    system_msg = (
-        "You are an expert on Transfer Pricing and financial analysis. "
-        "Use the information in the following context to answer the user's question. "
-        "Assign the greatest priority to the information that you gather from the financial analysis and the interview transcript. "
-        "If asked something not covered in this data, you may search the web."
-        "Ensure your analysis is CONCISE, SHARP, in paragraph form, and not long. Never use bullet points. "
-        "DO NOT INCLUDE MARKDOWN FORMATTING OR # SIGNS. Keep it to 200-300 words, maintain a professional tone. "
-        "Make sure to include direct sources and citations for the data you use for your decisions. Also include your reasoning for conclusions in brackets ()."
-        "If something is from the transcript or financial statement, include that citation in brackets with a URL to the specific section. Likewise include a URL to the relevant website if the information you got was from searching the internet. "
-        "You **may** consider the OECD guidelines below as helpful targets, but do NOT structure your response around them.\n\n"
-    )
-    messages = [
-        {"role": "system", "content": system_msg},
-        {"role": "user", "content":  context + prompt}
-    ]
-    resp = requests.post(API_ENDPOINT, headers=headers, json={"messages": messages})
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"].strip()
 
 def fill_excel_prompts(prompt: str, context: str, old_value: str, variable_name: str) -> str:
     headers = {"Content-Type": "application/json", "api-key": API_KEY}
@@ -245,12 +210,6 @@ def load_and_annotate_replacements(excel_file, context: str) -> Tuple[Dict[str, 
 # =========================
 # DOCX (existing) helpers
 # =========================
-def collapse_runs(paragraph):
-    from docx.oxml.ns import qn
-    text = "".join(r.text for r in paragraph.runs)
-    for r in reversed(paragraph.runs):
-        r._element.getparent().remove(r._element)
-    paragraph.add_run(text)
 
 
 def replace_in_paragraph(p, replacements: dict):
@@ -322,105 +281,6 @@ def replace_in_paragraph(p, replacements: dict):
     # _clear_red_on_non_placeholder_runs(p, repl)
     # _clear_paragraph_bullet_color(p)
 
-
-def _clear_paragraph_bullet_color(p):
-    try:
-        if p.style and p.style.font and getattr(p.style.font, "color", None):
-            p.style.font.color.rgb = None
-            p.style.font.color.theme_color = None
-    except Exception:
-        pass
-
-def _run_is_explicit_red(run) -> bool:
-    c = getattr(run.font, "color", None)
-    if not c or getattr(c, "rgb", None) is None:
-        return False
-    try:
-        r, g, b = c.rgb[0], c.rgb[1], c.rgb[2]
-        return (200 <= r <= 255 and 0 <= g <= 80 and 0 <= b <= 80) or (r >= 100 and b <=20 and g <=20)
-    except Exception:
-        return False
-
-def _clear_run_color(run):
-    if getattr(run.font, "color", None):
-        try:
-            run.font.color.rgb = None
-        except Exception:
-            pass
-        try:
-            run.font.color.theme_color = None
-        except Exception:
-            pass
-
-def _clear_red_on_non_placeholder_runs(p, replacements: dict):
-    keys = list(replacements.keys())
-    for run in p.runs:
-        text = run.text or ""
-        if not text:
-            continue
-        # If this run used to be a placeholder (red), but now has no placeholders, clear color
-        if _run_is_explicit_red(run):
-            if (not any(k in text for k in keys)) and ("{{" not in text and "}}" not in text):
-                _clear_run_color(run)
-
-
-
-
-def _rewrite_footnotes_xml_bytes(docx_bytes: bytes, replacements: dict) -> bytes:
-    """
-    Open a .docx (zip) from bytes, replace placeholders inside word/footnotes.xml,
-    and return new .docx bytes. If footnotes.xml is missing, return the original bytes.
-    """
-    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-    with ZipFile(BytesIO(docx_bytes)) as zin:
-        names = {i.filename for i in zin.infolist()}
-        if "word/footnotes.xml" not in names:
-            return docx_bytes  # no footnotes part
-
-        # Read and parse original footnotes.xml
-        foot_xml = zin.read("word/footnotes.xml")
-        root = etree.fromstring(foot_xml)
-
-        # Replace inside every w:t under w:footnote
-        # (Note: this is robust for tokens contained in a single text node.
-        # If your placeholders can split across runs, prefer the python-docx path.)
-        for t in root.findall(".//w:footnote//w:t", namespaces=ns):
-            if t.text:
-                new_text = t.text
-                for ph, val in replacements.items():
-                    if ph in new_text:
-                        new_text = new_text.replace(ph, val)
-                if new_text != t.text:
-                    t.text = new_text
-
-        # Build a new .docx with modified footnotes.xml
-        out_buf = BytesIO()
-        with ZipFile(out_buf, "w") as zout:
-            for item in zin.infolist():
-                data = zin.read(item.filename)
-                if item.filename == "word/footnotes.xml":
-                    data = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone="yes")
-                zout.writestr(item, data)
-        return out_buf.getvalue()
-
-
-def _apply_footnotes_xml_fallback_in_place(docx_path: str, replacements: dict) -> None:
-    """
-    Read a saved .docx from disk, run the XML fallback, and overwrite it in place.
-    Safe no-op if the document has no footnotes.xml.
-    """
-    try:
-        with open(docx_path, "rb") as f:
-            original = f.read()
-        updated = _rewrite_footnotes_xml_bytes(original, replacements)
-        if updated != original:
-            with open(docx_path, "wb") as f:
-                f.write(updated)
-    except Exception:
-        # Be defensive: never fail the whole pipeline if footnote rewrite trips.
-        pass
-
-
 def replace_placeholders_docx(doc: Document, replacements: dict):
     """Replace placeholders AFTER the first page break, preserving images and footnotes."""
     from docx.oxml.ns import qn
@@ -477,56 +337,6 @@ def replace_first_page_placeholders_docx(doc: Document, replacements: dict):
             break
 
 _BOUND = set("\n\r\t,.;:()[]{}<>—–-•|")
-
-def _first_occurrence_span(haystack: str, needle: str) -> Tuple[int, int]:
-    i = haystack.find(needle)
-    return (i, i + len(needle)) if i != -1 else (-1, -1)
-
-def make_unique_span(context: str, core: str, max_expand: int = 120) -> Tuple[str, Tuple[int,int]]:
-    """
-    Returns (unique_span, (L, R)). If core not found, returns ("", (0,0)).
-    Expands to nearest punctuation/newline boundaries until unique or limit hit.
-    """
-    core = (core or "").strip()
-    if not core:
-        return "", (0, 0)
-
-    if context.count(core) == 1:
-        s, e = _first_occurrence_span(context, core)
-        return context[s:e], (s, e)
-
-    s, e = _first_occurrence_span(context, core)
-    if s == -1:
-        return "", (0, 0)
-
-    L, R = s, e
-    expanded = 0
-    while expanded < max_expand and context.count(context[L:R]) != 1:
-        # expand left to previous boundary
-        l = L
-        while l > 0 and context[l-1] not in _BOUND:
-            l -= 1
-        if l == L and L > 0:  # no boundary nearby, nudge
-            l = max(0, L - 8)
-        L = l
-
-        if context.count(context[L:R]) == 1:
-            break
-
-        # expand right to next boundary
-        r = R
-        while r < len(context) and context[r] not in _BOUND:
-            r += 1
-        if r == R and R < len(context):  # no boundary nearby, nudge
-            r = min(len(context), R + 8)
-        R = r
-
-        expanded = (s - L) + (R - e)
-
-    span = context[L:R]
-    return (span if span and context.count(span) == 1 else ""), (L, R)
-
-
 
 def ask_variable_list(context: str, wait_seconds: float = 2.0, max_retries: int = 6):
     """
