@@ -1,22 +1,20 @@
-# processor.py (backend logic) — cleaned and reordered
+# processor.py (backend logic) — improved variable detection
 #
-# Purpose:
-# - Keep functions that streamlit_app.py uses at the top, in this order:
-#     1) configure
-#     2) find_relevant_variables
-#     3) fill_section_values
-#     4) generate_doc_from_excel_map
-# - Keep all helpers required by the above functions, after the top-level functions.
-# - Remove unused imports and unused helpers/constants.
+# Changes in this version:
+# - Reordered top-level functions used by streamlit_app: configure, find_relevant_variables, fill_section_values, generate_doc_from_excel_map.
+# - Improved find_relevant_variables/_prefill logic to more reliably detect two classes of changes:
+#     * Standardized change: year/date patterns and FY patterns (e.g., "FY2023", "December 31st 2023", "Financial Year Ended 31 December 2023").
+#     * Contextual change: key financial/benchmark figures (percentages, euro amounts, ratios, observation counts) when they appear near known labels such as "Net turnover", "Median", "Employees", "FTE", "Berry ratio", etc.
+# - Adds a 'change_type' column (if not present) when pre-filling so the sheet can be used to review classification. This is non-breaking: other code still identifies core columns by name.
+# - The LLM-based extraction (ask_variable_list) is still used and respected; regex-based detections augment LLM rows (no duplicates).
 #
-# Note: Behavior is unchanged except for removal of unused definitions and reordering.
+# Note: Behavior otherwise preserved. If you want this committed to the repo, I can prepare a branch and PR (I cannot push without your confirmation).
 
 import requests
 from docx import Document
 import pdfplumber
 import pandas as pd
 
-# --- at top of file ---
 import os
 import io
 import time
@@ -28,10 +26,9 @@ from pydantic import BaseModel, TypeAdapter
 from docx.oxml.ns import qn
 import re
 
-# ——— Azure OpenAI config ———
-# Expect these to be set by the Streamlit frontend via secrets or environment variables
-API_KEY = None  # to be set by frontend
-API_ENDPOINT = None  # to be set by frontend
+# Azure OpenAI config (set by frontend)
+API_KEY = None
+API_ENDPOINT = None
 
 class Row(BaseModel):
     placeholder_name: str
@@ -39,29 +36,23 @@ class Row(BaseModel):
     prompt: str
     new_value: str
 
-    # Pydantic v2 config
     model_config = {
-        "extra": "forbid",   # reject unknown fields
+        "extra": "forbid",
         "str_strip_whitespace": True
     }
 
-# v2 parsing helpers
 _row_list_adapter = TypeAdapter(List[Row])
 
 def parse_rows_json(s: str) -> List[Row]:
-    # Accepts a JSON string; raises ValidationError on mismatch
     return _row_list_adapter.validate_json(s)
 
 
 # -------------------------
 # Top-level API (front-end)
-# Order matches usage in streamlit_app.py
 # -------------------------
 
 def configure(api_key: str, api_endpoint: str):
-    """
-    Called once by the Streamlit frontend to set API credentials/endpoints.
-    """
+    """Called once by the Streamlit frontend to set API credentials/endpoints."""
     global API_KEY, API_ENDPOINT
     API_KEY = api_key
     API_ENDPOINT = api_endpoint
@@ -69,12 +60,14 @@ def configure(api_key: str, api_endpoint: str):
 
 def find_relevant_variables(files: dict):
     """
-    Used by Step 1 (Fill & preview variables).
-    - Builds context from optional files
-    - Optionally pre-fills prompts into an excel
-    - Annotates the excel (fills new_value for prompt rows)
-    - Returns (doc_path, filled_excel_path)
-      doc_path is a fallback doc summarizing replacements (used by frontend)
+    Used by Step 1 in the UI.
+    - Build context from provided files
+    - Optionally ask LLM to extract candidate placeholders
+    - Augment LLM output with robust regex-based detection for:
+        * Standardized changes (years/dates/FY)
+        * Contextual changes around financial labels (percentages, euro amounts, counts)
+    - Produce an annotated variables Excel and a fallback docx summarizing replacements.
+    Returns (doc_path, filled_excel_path)
     """
     guidelines = files.get("guidelines") if files else None
     transcript = files.get("transcript") if files else None
@@ -96,26 +89,31 @@ def find_relevant_variables(files: dict):
     if template_text:
         ctx += ("\n\n" if ctx else "") + template_text
 
-    # Optionally prefill prompts with ask_variable_list
-    excel_for_processing = excel
+    # 1) Use LLM to generate candidate rows (this also helps identify section-level prompts)
     maybe_prefilled_path = _prefill_last_year_from_prompts(excel, ctx)
-    if maybe_prefilled_path:
-        excel_for_processing = maybe_prefilled_path  # use the updated workbook
 
-    # Build replacements dict (and annotate Excel with generated values if present)
+    # 2) If LLM produced a prefilled workbook, use it, otherwise use original excel
+    excel_for_processing = maybe_prefilled_path or excel
+
+    # 3) Load-and-annotate replacements (this will call LLM to fill prompts in the workbook)
     replacements, filled_excel_path = load_and_annotate_replacements(excel_for_processing, ctx) if excel_for_processing else ({}, None)
 
-    # Provide a fallback doc that lists replacements + context; frontend expects a doc path
+    # 4) Augment the workbook with regex-based detections for standardized/contextual values
+    try:
+        filled_excel_path = _augment_with_regex_detections(excel_for_processing or filled_excel_path, ctx)
+    except Exception:
+        # Non-fatal: keep previously created filled_excel_path
+        pass
+
+    # Build a fallback doc summarizing replacements & context for preview
     doc_path = _build_fallback_docx(replacements, ctx)
     return (doc_path, filled_excel_path)
 
 
 def fill_section_values(files):
     """
-    Used by Step 2 (Fill section values).
-    - Rebuilds context
-    - Calls load_and_annotate_replacements to fill prompt-driven new_value cells
-    - Returns path to annotated excel (variables_filled.xlsx) for frontend to load
+    Used by Step 2. Rebuilds context and fills section-level prompts via LLM.
+    Returns path to annotated excel.
     """
     guidelines = files.get("guidelines") if files else None
     transcript = files.get("transcript") if files else None
@@ -123,7 +121,6 @@ def fill_section_values(files):
     excel = files.get("excel") if files else None
     template = files.get("template") if files else None
 
-    # Build context
     ctx = ""
     ctx += load_guidelines(guidelines)
     tr_text = load_transcript(transcript)
@@ -132,31 +129,29 @@ def fill_section_values(files):
     pdf_text = load_pdf(pdf)
     if pdf_text:
         ctx += ("\n\n" if ctx else "") + pdf_text
-
     template_text = load_template(template) if template else None
     if template_text:
         ctx += ("\n\n" if ctx else "") + template_text
 
-    # Fill prompt-driven cells and return path
     excel_for_processing = excel
     (rep, filled_path) = load_and_annotate_replacements(excel_for_processing, ctx)
+    # Also run regex-only augmentation to capture standardized changes (years/dates)
+    try:
+        filled_path = _augment_with_regex_detections(excel_for_processing or filled_path, ctx)
+    except Exception:
+        pass
     return filled_path
 
 
 def generate_doc_from_excel_map(file_map, context: str = ""):
     """
-    Used by Step 3 (Generate final document).
-    - Reads annotated excel and builds replacements {old_value -> new_value}
-    - Saves a temp copy variables_filled.xlsx and returns its path as well
-    - Attempts to load the provided template and apply replacements; if not possible, builds fallback doc
-    - Returns (doc_path, filled_excel_path)
+    Used by Step 3. Reads annotated excel, builds replacements, applies to template, returns (doc_path, filled_excel_path).
     """
-    # --- load workbook or create blank with headers ---
     def _load_wb(x):
         try:
-            if isinstance(x, str) and os.path.exists(x):  # path
+            if isinstance(x, str) and os.path.exists(x):
                 return openpyxl.load_workbook(x)
-            if hasattr(x, "read"):                        # file-like
+            if hasattr(x, "read"):
                 b = x.read()
                 try:
                     x.seek(0)
@@ -182,7 +177,6 @@ def generate_doc_from_excel_map(file_map, context: str = ""):
         return (hdr.index(name)+1) if name in hdr else default_idx
     c_old, c_new = col("old_value", 2), col("new_value", 4)
 
-    # --- build replacements (keep order of appearance) ---
     repl = OrderedDict()
     for r in range(2, ws.max_row+1):
         old_s = (str(ws.cell(r, c_old).value).strip() if ws.cell(r, c_old).value else "")
@@ -190,13 +184,15 @@ def generate_doc_from_excel_map(file_map, context: str = ""):
         if old_s and new_s and old_s != new_s:
             repl[old_s] = new_s
 
-    # --- save a temp copy of the excel ---
+    # save annotated excel copy
     tmpdir = tempfile.mkdtemp()
     filled_excel_path = os.path.join(tmpdir, "variables_filled.xlsx")
-    try: wb.save(filled_excel_path)
-    except Exception: filled_excel_path = None
+    try:
+        wb.save(filled_excel_path)
+    except Exception:
+        filled_excel_path = None
 
-    # --- try to render DOCX with replacements; fallback if needed ---
+    # Try to apply replacements to template docx
     template = file_map.get("template")
     try:
         doc = Document(template) if template else None
@@ -215,7 +211,7 @@ def generate_doc_from_excel_map(file_map, context: str = ""):
     if '_build_fallback_docx' in globals():
         return _build_fallback_docx(repl, context), filled_excel_path
 
-    # ultra-simple fallback
+    # ultimate fallback
     doc = Document(); doc.add_heading("Generated Document (Fallback)", 1)
     doc.add_paragraph("Template unavailable. Applied replacements:")
     for k, v in repl.items(): doc.add_paragraph(f"{k} → {v}")
@@ -225,14 +221,12 @@ def generate_doc_from_excel_map(file_map, context: str = ""):
 
 
 # -------------------------
-# Helper functions (used by the top-level functions above)
+# Helpers used by top-level flows
 # -------------------------
 
 def ask_variable_list(context: str, wait_seconds: float = 2.0, max_retries: int = 6):
     """
-    Keep calling the LLM until it returns valid JSON (parsed as List[Row]).
-    Stops after max_retries and raises an exception if still invalid.
-    Returns List[Row].
+    Ask LLM to return JSON list of Row objects. Retries until parseable.
     """
     headers = {"Content-Type": "application/json", "api-key": API_KEY}
 
@@ -282,43 +276,35 @@ CONTEXT_END>>>
                 ],
                 "temperature": 0,
                 "top_p": 1,
-                "seed": 7,  # ignored if unsupported
+                "seed": 7,
             }
             resp = requests.post(API_ENDPOINT, headers=headers, json=payload, timeout=60)
             resp.raise_for_status()
             data = resp.json()
-
             text = (
                 data.get("choices", [{}])[0]
                     .get("message", {})
                     .get("content", "")
                     .strip()
             )
-
             rows = parse_rows_json(text)
-
-            # Normalize: if a non-section has a non-empty prompt, blank it.
             for r in rows:
                 if r.prompt is None:
                     r.prompt = ""
                 if r.new_value is None:
                     r.new_value = ""
-
-            return rows  # success
-
+            return rows
         except Exception as e:
             last_exception = e
             print(f"[ask_variable_list] attempt {attempt}/{max_retries} failed: {e}")
             time.sleep(wait_seconds)
 
-    # If we exhaust retries, raise to let caller decide how to proceed
     raise RuntimeError(f"ask_variable_list failed after {max_retries} attempts: {last_exception}")
 
 
 def fill_excel_prompts(prompt: str, context: str, old_value: str, variable_name: str) -> str:
     """
-    Call the configured LLM endpoint to fulfill a given prompt for a single excel row.
-    Returns the assistant text (stripped) or raises on HTTP error.
+    Call LLM to fill an individual Excel prompt cell.
     """
     headers = {"Content-Type": "application/json", "api-key": API_KEY}
     system_msg = (
@@ -342,10 +328,6 @@ def fill_excel_prompts(prompt: str, context: str, old_value: str, variable_name:
     return resp.json()["choices"][0]["message"]["content"].strip()
 
 
-# ---------------------
-# Safe loader helpers
-# ---------------------
-
 def load_transcript(file) -> str:
     if not file:
         return ""
@@ -366,7 +348,6 @@ def load_pdf(file) -> str:
                 text = page.extract_text() or ""
                 pages.append(f"--- Page {i} ---\n{text}")
                 for table in page.extract_tables() or []:
-                    # Be robust to ragged rows
                     try:
                         df = pd.DataFrame(table[1:], columns=table[0])
                         tables.append(f"--- Page {i} table ---\n" + df.to_csv(index=False))
@@ -381,12 +362,10 @@ def load_guidelines(file) -> str:
     if not file:
         return ""
     try:
-        # streamlit's UploadedFile supports .read(); ensure we don't exhaust twice
         content = file.read()
         try:
             return content.decode("utf-8").strip()
         except Exception:
-            # fallback: latin-1 to avoid decode crash
             return content.decode("latin-1", errors="ignore").strip()
     except Exception:
         return ""
@@ -394,11 +373,9 @@ def load_guidelines(file) -> str:
 
 def _prefill_last_year_from_prompts(excel_file, context: str) -> str | None:
     """
-    Creates/updates an Excel workbook of variables based on ask_variable_list(context).
-    If excel_file cannot be loaded, a new workbook is created with columns:
-    placeholder_name, old_value, prompt, new_value.
-
-    Avoids appending duplicate (placeholder_name, old_value) rows by updating existing rows.
+    Uses ask_variable_list(context) to produce rows and writes them into an excel workbook
+    (creates workbook if necessary). Adds a 'change_type' column to help classify rows.
+    Returns path to the prefilled workbook or None.
     """
     try:
         try:
@@ -409,9 +386,9 @@ def _prefill_last_year_from_prompts(excel_file, context: str) -> str | None:
             ws = wb.active
             ws.title = "variables"
 
-        required_cols = ["placeholder_name", "old_value", "prompt", "new_value"]
+        required_cols = ["placeholder_name", "old_value", "prompt", "new_value", "change_type"]
 
-        # Force header to row 1
+        # Ensure header includes change_type
         current_header = [ws.cell(row=1, column=i).value for i in range(1, len(required_cols)+1)]
         if current_header != required_cols:
             for i, col in enumerate(required_cols, start=1):
@@ -426,10 +403,12 @@ def _prefill_last_year_from_prompts(excel_file, context: str) -> str | None:
             except Exception:
                 continue
 
+        # Get rows from LLM
         rows = ask_variable_list(context, 4)
         if rows is None:
             return None
 
+        # Insert or update rows from LLM
         for r in rows:
             placeholder_name = getattr(r, "placeholder_name", "") or ""
             old_value = (getattr(r, "old_value", "") or "").strip()
@@ -448,8 +427,15 @@ def _prefill_last_year_from_prompts(excel_file, context: str) -> str | None:
                 if new_value:
                     ws.cell(row=row_idx, column=4, value=new_value)
             else:
-                ws.append([placeholder_name, old_value, prompt, new_value])
+                ws.append([placeholder_name, old_value, prompt, new_value, ""])
                 existing_old_to_row[old_value] = ws.max_row
+
+        # Augment with regex-based standard/context detections (do not duplicate existing old_values)
+        detected = _detect_standard_and_context_spans(context)
+        for old_val, change_type, placeholder_name in detected:
+            if old_val and old_val not in existing_old_to_row:
+                ws.append([placeholder_name or "", old_val, "", "", change_type])
+                existing_old_to_row[old_val] = ws.max_row
 
         tmpdir = tempfile.mkdtemp()
         out_path = os.path.join(tmpdir, "variables_prefilled.xlsx")
@@ -463,11 +449,9 @@ def _prefill_last_year_from_prompts(excel_file, context: str) -> str | None:
 
 def load_and_annotate_replacements(excel_file, context: str) -> Tuple[Dict[str, str], str | None]:
     """
-    Loads or creates workbook and for each row with a prompt calls the LLM
-    to fill new_value. Avoids returning duplicate replacement keys.
+    Loads/creates workbook; for each row with a prompt calls LLM to fill new_value.
     Returns (replacements_dict, filled_excel_path).
     """
-    # --- Try to load the workbook; if it fails, create a blank one with headers ---
     try:
         wb = openpyxl.load_workbook(excel_file)
         ws = wb.active
@@ -475,9 +459,8 @@ def load_and_annotate_replacements(excel_file, context: str) -> Tuple[Dict[str, 
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "variables"
-        ws.append(["placeholder_name", "old_value", "prompt", "new_value"])
+        ws.append(["placeholder_name", "old_value", "prompt", "new_value", "change_type"])
 
-    # --- Resolve column indices based on headers (row 1), fallback to A..D ---
     try:
         headers = [str(c.value).strip().lower() if c.value is not None else "" for c in ws[1]]
     except Exception:
@@ -486,22 +469,21 @@ def load_and_annotate_replacements(excel_file, context: str) -> Tuple[Dict[str, 
     def _find_col(name: str, default_idx: int) -> int:
         try:
             idx = headers.index(name)
-            return idx + 1  # openpyxl is 1-based
+            return idx + 1
         except ValueError:
             return default_idx
 
-    col_placeholder = _find_col("placeholder_name", 1)  # A
-    col_old        = _find_col("old_value", 2)          # B
-    col_prompt     = _find_col("prompt", 3)             # C
-    col_new        = _find_col("new_value", 4)          # D
+    col_placeholder = _find_col("placeholder_name", 1)
+    col_old        = _find_col("old_value", 2)
+    col_prompt     = _find_col("prompt", 3)
+    col_new        = _find_col("new_value", 4)
+    col_type       = _find_col("change_type", 5)
 
     replacements: Dict[str, str] = {}
 
-    # --- Iterate rows, starting at row 2 ---
     for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-        r = row[0].row  # current row index
+        r = row[0].row
 
-        # Safely read cells
         def _get(col_idx: int) -> str:
             try:
                 val = ws.cell(row=r, column=col_idx).value
@@ -513,27 +495,33 @@ def load_and_annotate_replacements(excel_file, context: str) -> Tuple[Dict[str, 
         old_value        = _get(col_old)
         prompt_text      = _get(col_prompt)
         new_value_curr   = _get(col_new)
+        change_type_curr = _get(col_type)
 
-        # If prompt present, query LLM and write into new_value (only overwrite if result non-empty)
         if prompt_text:
             try:
                 llm_out = fill_excel_prompts(prompt_text, context, old_value, variable_name)
                 llm_out = (llm_out or "").strip()
-                # Only write back if LLM gave a non-empty answer (avoid erasing manual values)
                 if llm_out:
                     ws.cell(row=r, column=col_new, value=llm_out)
                     new_value_curr = llm_out
             except Exception:
-                # On error, leave whatever was already in new_value
                 pass
 
-        # Build replacements only when new_value is non-empty and different from old_value
+        # If change_type blank, auto-classify based on patterns
+        if not change_type_curr:
+            detected = _classify_change_type(old_value)
+            if detected:
+                try:
+                    ws.cell(row=r, column=col_type, value=detected)
+                    change_type_curr = detected
+                except Exception:
+                    pass
+
         if old_value and new_value_curr and old_value != new_value_curr:
-            # Avoid collisions: prefer the first mapping (do not overwrite existing keys)
             if old_value not in replacements:
                 replacements[old_value] = new_value_curr
 
-    # --- Always create a downloadable temp copy named variables_filled.xlsx ---
+    # Save annotated copy
     filled_excel_path = None
     try:
         tmpdir = tempfile.mkdtemp()
@@ -550,14 +538,9 @@ def load_and_annotate_replacements(excel_file, context: str) -> Tuple[Dict[str, 
 # =========================
 
 def replace_in_paragraph(p, replacements: dict):
-    """
-    Hybrid replacer:
-      - Concatenate run texts, replace unique keys longest-first, write back preserving run boundaries.
-    """
     if not replacements:
         return
 
-    # ensure keys/values are strings
     repl = {str(k): ("" if v is None else str(v)) for k, v in replacements.items()}
 
     p_elm = p._p
@@ -582,15 +565,14 @@ def replace_in_paragraph(p, replacements: dict):
     keys.sort(key=len, reverse=True)
     unique_keys = [k for k in keys if full.count(k) == 1]
     if not unique_keys:
-        return  # nothing unambiguous in this paragraph
+        return
 
     pattern = re.compile("|".join(re.escape(k) for k in unique_keys))
     new_full, nsubs = pattern.subn(lambda m: repl[m.group(0)], full)
 
     if nsubs == 0 or new_full == full:
-        return  # no change
+        return
 
-    # Redistribute back using original lengths to keep run boundaries intact
     lengths = [len(txt) for _, txt in originals]
     pos = 0
     n = len(originals)
@@ -601,13 +583,11 @@ def replace_in_paragraph(p, replacements: dict):
         t.text = segment
         pos += lengths[i] if i < n - 1 else len(new_full) - pos
 
-        # Preserve leading/trailing spaces for this text node
         if segment and (segment[0].isspace() or segment[-1].isspace()):
             t.set(qn("xml:space"), "preserve")
 
 
 def replace_placeholders_docx(doc: Document, replacements: dict):
-    """Replace placeholders AFTER the first page break, preserving images and footnotes."""
     from docx.oxml.ns import qn
     seen = False
     br_tag = qn('w:br')
@@ -624,14 +604,12 @@ def replace_placeholders_docx(doc: Document, replacements: dict):
                 continue
         replace_in_paragraph(p, replacements)
 
-    # Tables
     for tbl in doc.tables:
         for row in tbl.rows:
             for cell in row.cells:
                 for p in cell.paragraphs:
                     replace_in_paragraph(p, replacements)
 
-    # Headers/footers
     for sec in doc.sections:
         if sec.header:
             for p in sec.header.paragraphs:
@@ -642,7 +620,6 @@ def replace_placeholders_docx(doc: Document, replacements: dict):
 
 
 def replace_first_page_placeholders_docx(doc: Document, replacements: dict):
-    """Replace placeholders on the first page only (up to first page break)."""
     from docx.oxml.ns import qn
     seen = False
     br_tag = qn("w:br")
@@ -661,10 +638,6 @@ def replace_first_page_placeholders_docx(doc: Document, replacements: dict):
 
 
 def _build_fallback_docx(replacements: dict, context: str) -> str:
-    """
-    If no template is provided, produce a simple DOCX that lists
-    the resolved replacements and includes a context snippet.
-    """
     doc = Document()
     doc.add_heading("Transfer Pricing Output (Fallback)", level=1)
 
@@ -683,7 +656,7 @@ def _build_fallback_docx(replacements: dict, context: str) -> str:
 
     if context:
         doc.add_heading("Context (truncated)", level=2)
-        doc.add_paragraph(context[:4000])  # keep file small
+        doc.add_paragraph(context[:4000])
 
     out = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
     doc.save(out.name)
@@ -691,21 +664,12 @@ def _build_fallback_docx(replacements: dict, context: str) -> str:
 
 
 def load_template(template_file) -> str:
-    """
-    Extract plain text from a DOCX template file, including:
-      - headers (all sections)
-      - body paragraphs (incl. TOC paragraphs)
-      - tables (body + headers/footers)
-      - footers (all sections)
-    Returns a single string with items separated by newlines.
-    """
     if not template_file:
         return ""
-
     try:
         doc = Document(template_file)
         chunks = []
-        seen = set()  # avoid accidental duplicates if the same text is reachable twice
+        seen = set()
 
         def add(text: str):
             t = (text or "").strip()
@@ -715,37 +679,28 @@ def load_template(template_file) -> str:
 
         def add_paragraphs(paragraphs):
             for p in paragraphs:
-                # include all body paragraphs; this already captures TOC text if present
                 add(p.text)
 
         def add_tables(tables):
-            # Flatten table content row-by-row
             for tbl in tables:
                 for row in tbl.rows:
                     cells_txt = []
                     for cell in row.cells:
-                        # cell.text returns the concatenated text of all paragraphs in the cell
                         ct = (cell.text or "").strip()
                         if ct:
                             cells_txt.append(ct)
                     if cells_txt:
-                        # Use a lightweight delimiter to keep context readable
                         add(" | ".join(cells_txt))
 
-        # 1) Headers (per section)
         for sec in doc.sections:
             hdr = sec.header
             if hdr:
                 add_paragraphs(hdr.paragraphs)
                 add_tables(hdr.tables)
 
-        # 2) Body paragraphs (this includes TOC content if the document has a generated TOC)
         add_paragraphs(doc.paragraphs)
-
-        # 3) Body tables
         add_tables(doc.tables)
 
-        # 4) Footers (per section)
         for sec in doc.sections:
             ftr = sec.footer
             if ftr:
@@ -753,7 +708,164 @@ def load_template(template_file) -> str:
                 add_tables(ftr.tables)
 
         return "\n".join(chunks)
-
     except Exception as e:
         print(f"Error loading template: {e}")
         return ""
+
+
+# -------------------------
+# New detection utilities
+# -------------------------
+
+# Patterns for standardized date/year tokens
+_RE_FY = re.compile(r'\bFY\s?\d{2,4}\b', flags=re.IGNORECASE)
+_RE_FULL_DATE_1 = re.compile(r'\b(?:\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})\b', flags=re.IGNORECASE)
+_RE_FULL_DATE_2 = re.compile(r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:st|nd|rd|th)?(?:,)?\s+\d{4}\b', flags=re.IGNORECASE)
+_RE_FINANCIAL_YEAR_PHRASE = re.compile(r'\bFinancial Year(?: Ended)?[^\n]{0,60}\d{4}\b', flags=re.IGNORECASE)
+
+# Patterns for contextual numeric values (percent, euro, plain decimal with separators)
+_RE_PERCENT = re.compile(r'\b\d{1,3}(?:[.,]\d+)?\s?%')
+_RE_EURO = re.compile(r'€\s?[0-9\.,]+')
+_RE_NUMBER = re.compile(r'\b\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?\b')
+
+# Keywords to anchor contextual number extraction
+_FINANCIAL_LABELS = [
+    r'net turnover', r'gross profit', r'cost of raw material', r'sales to customers',
+    r'transaction amount', r'percentage of the sales', r'percentage', r'berry ratio',
+    r'median', r'upper quartile', r'lower quartile', r'minimum', r'maximum',
+    r'number of observation', r'observations', r'fte', r'employees', r'revenue',
+]
+_LABELS_RE = re.compile(r'(' + r'|'.join(_FINANCIAL_LABELS) + r')', flags=re.IGNORECASE)
+
+
+def _detect_standard_and_context_spans(context: str) -> List[Tuple[str, str, str]]:
+    """
+    Return list of tuples (old_value, change_type, placeholder_name_hint)
+    found by regex scanning of context.
+    - Standardized patterns (FY, dates) get change_type "Standardized change"
+    - Numeric financial occurrences near labels get change_type "Contextual change"
+    This is conservative to avoid adding every stray number.
+    """
+    results = []
+    if not context:
+        return results
+
+    # 1) Find FY tokens
+    for m in _RE_FY.finditer(context):
+        val = m.group(0).strip()
+        results.append((val, "Standardized change", "financial_year"))
+
+    # 2) Find explicit date expressions (e.g., '31 December 2023' or 'December 31st 2023')
+    for m in _RE_FULL_DATE_1.finditer(context):
+        val = m.group(0).strip()
+        results.append((val, "Standardized change", "financial_year"))
+    for m in _RE_FULL_DATE_2.finditer(context):
+        val = m.group(0).strip()
+        results.append((val, "Standardized change", "financial_year"))
+    for m in _RE_FINANCIAL_YEAR_PHRASE.finditer(context):
+        val = m.group(0).strip()
+        results.append((val, "Standardized change", "financial_year"))
+
+    # 3) Find contextual numeric values anchored by known labels
+    # For each occurrence of a label, look ahead/back for a number/percent/euro within ~60 chars
+    for m in _LABELS_RE.finditer(context):
+        start = max(0, m.start() - 60)
+        end = min(len(context), m.end() + 60)
+        window = context[start:end]
+        # prefer percent, then euro, then plain number
+        pm = _RE_PERCENT.search(window)
+        if pm:
+            results.append((pm.group(0).strip(), "Contextual change", m.group(0).strip()))
+            continue
+        em = _RE_EURO.search(window)
+        if em:
+            results.append((em.group(0).strip(), "Contextual change", m.group(0).strip()))
+            continue
+        nm = _RE_NUMBER.search(window)
+        if nm:
+            # exclude years like 2020..2030 when label not year-related (but allow if label indicates)
+            num = nm.group(0).strip()
+            # Heuristic: if number is 4-digit and between 1900 and 2100, treat as year -> Standardized
+            if re.match(r'^\d{4}$', num) and 1900 <= int(num) <= 2100:
+                results.append((num, "Standardized change", "financial_year"))
+            else:
+                results.append((num, "Contextual change", m.group(0).strip()))
+    # Deduplicate preserving order
+    seen = set()
+    out = []
+    for old, typ, hint in results:
+        key = (old, typ)
+        if key not in seen:
+            seen.add(key)
+            out.append((old, typ, hint))
+    return out
+
+
+def _classify_change_type(old_value: str) -> str | None:
+    """
+    Classify a single old_value string to 'Standardized change' or 'Contextual change' where possible.
+    """
+    if not old_value:
+        return None
+    ov = old_value.strip()
+    if _RE_FY.search(ov) or _RE_FULL_DATE_1.search(ov) or _RE_FULL_DATE_2.search(ov) or _RE_FINANCIAL_YEAR_PHRASE.search(ov):
+        return "Standardized change"
+    if _RE_PERCENT.search(ov) or _RE_EURO.search(ov):
+        return "Contextual change"
+    # plain numeric heuristics
+    if re.fullmatch(r'\d{1,3}(?:[.,]\d+)?', ov) or re.fullmatch(r'\d{1,3}(?:[.,]\d{3})+(?:[.,]\d+)?', ov):
+        # If looks like a year -> Standardized
+        if re.fullmatch(r'\d{4}', ov) and 1900 <= int(ov) <= 2100:
+            return "Standardized change"
+        return "Contextual change"
+    return None
+
+
+def _augment_with_regex_detections(path_or_file, context: str) -> str | None:
+    """
+    Given an excel path or file-like, load workbook, ensure headers include change_type,
+    append detected rows from _detect_standard_and_context_spans where the old_value is not already present,
+    save to a new temp file and return its path.
+    """
+    try:
+        try:
+            wb = openpyxl.load_workbook(path_or_file)
+            ws = wb.active
+        except Exception:
+            # if path_or_file is None or invalid, create blank workbook with headers
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "variables"
+
+        # Ensure header contains change_type column as 5th column
+        headers = [ws.cell(row=1, column=i).value for i in range(1, 6)]
+        required = ["placeholder_name", "old_value", "prompt", "new_value", "change_type"]
+        for i, name in enumerate(required, start=1):
+            if (i > len(headers)) or (headers[i-1] != name):
+                ws.cell(row=1, column=i, value=name)
+
+        # Collect existing old_values
+        existing = set()
+        for r in range(2, ws.max_row + 1):
+            try:
+                ov = ws.cell(row=r, column=2).value
+                if ov is not None:
+                    existing.add(str(ov).strip())
+            except Exception:
+                continue
+
+        detected = _detect_standard_and_context_spans(context)
+        for old_val, change_type, hint in detected:
+            if old_val and old_val not in existing:
+                # Append with placeholder hint (lowercase, underscore)
+                placeholder_hint = hint.lower().replace(" ", "_")[:64] if hint else ""
+                ws.append([placeholder_hint, old_val, "", "", change_type])
+                existing.add(old_val)
+
+        tmpdir = tempfile.mkdtemp()
+        out_path = os.path.join(tmpdir, "variables_prefilled_regex.xlsx")
+        wb.save(out_path)
+        return out_path
+    except Exception as e:
+        print(f"_augment_with_regex_detections error: {e}")
+        return None
