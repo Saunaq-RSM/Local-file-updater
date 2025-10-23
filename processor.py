@@ -733,7 +733,7 @@ _FINANCIAL_LABELS = [
     r'net turnover', r'gross profit', r'cost of raw material', r'sales to customers',
     r'transaction amount', r'percentage of the sales', r'percentage', r'berry ratio',
     r'median', r'upper quartile', r'lower quartile', r'minimum', r'maximum',
-    r'number of observation', r'observations', r'fte', r'employees', r'revenue',
+    r'number of observation', r'observations', r'fte', r'employees', r'revenue', r'gross profit', r'expenses', r'amotisation', r'operating result',
 ]
 _LABELS_RE = re.compile(r'(' + r'|'.join(_FINANCIAL_LABELS) + r')', flags=re.IGNORECASE)
 
