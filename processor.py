@@ -769,8 +769,8 @@ def _detect_standard_and_context_spans(context: str) -> List[Tuple[str, str, str
     # 3) Find contextual numeric values anchored by known labels
     # For each occurrence of a label, look ahead/back for a number/percent/euro within ~60 chars
     for m in _LABELS_RE.finditer(context):
-        start = max(0, m.start() - 200)
-        end = min(len(context), m.end() + 200)
+        start = max(0, m.start() - 100)
+        end = min(len(context), m.end() + 100)
         window = context[start:end]
         # prefer percent, then euro, then plain number
         pm = _RE_PERCENT.search(window)
