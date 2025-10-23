@@ -31,7 +31,7 @@ API_KEY = None
 API_ENDPOINT = None
 
 class Row(BaseModel):
-    placeholder_name: str
+    variable_name: str
     old_value: str
     prompt: str
     new_value: str
@@ -162,7 +162,7 @@ def generate_doc_from_excel_map(file_map, context: str = ""):
             pass
         wb = openpyxl.Workbook()
         ws = wb.active
-        ws.append(["placeholder_name", "old_value", "prompt", "new_value"])
+        ws.append(["variable_name", "old_value", "prompt", "new_value"])
         return wb
 
     wb = _load_wb(file_map.get("excel"))
@@ -232,7 +232,7 @@ def ask_variable_list(context: str, wait_seconds: float = 2.0, max_retries: int 
 
     system_msg = (
         "You output ONLY JSON: an array of objects with exactly these keys: "
-        "placeholder_name, old_value, prompt, new_value. No prose/markdown. "
+        "variable_name, old_value, prompt, new_value. No prose/markdown. "
         "Never output any object where a value equals its key name "
         '(e.g., "old_value":"old_value"). If you cannot find valid rows, return [].'
     )
@@ -242,7 +242,7 @@ You are a meticulous placeholder auditor for corporate documents (transfer prici
 
 OUTPUT
 Return ONLY a JSON array. Each element must have exactly:
-- "placeholder_name": string (for section-level use "SECTION:<name>")
+- "variable_name": string (for section-level use "SECTION:<name>")
 - "old_value": string
 - "prompt": string (non-empty ONLY if the placeholder is a whole section needing rewrite; otherwise "")
 - "new_value": string (empty if <80% confident)
@@ -255,7 +255,7 @@ RULES
 - **If a bare value would occur multiple times, expand old_value by including adjacent label/unit/words from CONTEXT until the span is unique (e.g., prefer 'employees: 14 FTEs' over '14').**
 - **Do not invent header/example rows; do not use key names as values.**
 - **For non-section placeholders, prompt must be empty (''); for SECTION:<name> rows, prompt must be non-empty.**
-- **Deduplicate: do not output multiple rows with the same (placeholder_name, old_value).**
+- **Deduplicate: do not output multiple rows with the same (variable_name, old_value).**
 
 CONTEXT
 <<<CONTEXT_START
@@ -386,7 +386,7 @@ def _prefill_last_year_from_prompts(excel_file, context: str) -> str | None:
             ws = wb.active
             ws.title = "variables"
 
-        required_cols = ["placeholder_name", "old_value", "prompt", "new_value", "change_type"]
+        required_cols = ["variable_name", "old_value", "prompt", "new_value", "change_type"]
 
         # Ensure header includes change_type
         current_header = [ws.cell(row=1, column=i).value for i in range(1, len(required_cols)+1)]
@@ -410,31 +410,31 @@ def _prefill_last_year_from_prompts(excel_file, context: str) -> str | None:
 
         # Insert or update rows from LLM
         for r in rows:
-            placeholder_name = getattr(r, "placeholder_name", "") or ""
+            variable_name = getattr(r, "variable_name", "") or ""
             old_value = (getattr(r, "old_value", "") or "").strip()
             prompt = getattr(r, "prompt", "") or ""
             new_value = getattr(r, "new_value", "") or ""
 
-            if not old_value and not placeholder_name:
+            if not old_value and not variable_name:
                 continue
 
             if old_value in existing_old_to_row:
                 row_idx = existing_old_to_row[old_value]
-                ws.cell(row=row_idx, column=1, value=placeholder_name)
+                ws.cell(row=row_idx, column=1, value=variable_name)
                 ws.cell(row=row_idx, column=2, value=old_value)
                 if prompt:
                     ws.cell(row=row_idx, column=3, value=prompt)
                 if new_value:
                     ws.cell(row=row_idx, column=4, value=new_value)
             else:
-                ws.append([placeholder_name, old_value, prompt, new_value, ""])
+                ws.append([variable_name, old_value, prompt, new_value, ""])
                 existing_old_to_row[old_value] = ws.max_row
 
         # Augment with regex-based standard/context detections (do not duplicate existing old_values)
         detected = _detect_standard_and_context_spans(context)
-        for old_val, change_type, placeholder_name in detected:
+        for old_val, change_type, variable_name in detected:
             if old_val and old_val not in existing_old_to_row:
-                ws.append([placeholder_name or "", old_val, "", "", change_type])
+                ws.append([variable_name or "", old_val, "", "", change_type])
                 existing_old_to_row[old_val] = ws.max_row
 
         tmpdir = tempfile.mkdtemp()
@@ -459,7 +459,7 @@ def load_and_annotate_replacements(excel_file, context: str) -> Tuple[Dict[str, 
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "variables"
-        ws.append(["placeholder_name", "old_value", "prompt", "new_value", "change_type"])
+        ws.append(["variable_name", "old_value", "prompt", "new_value", "change_type"])
 
     try:
         headers = [str(c.value).strip().lower() if c.value is not None else "" for c in ws[1]]
@@ -473,7 +473,7 @@ def load_and_annotate_replacements(excel_file, context: str) -> Tuple[Dict[str, 
         except ValueError:
             return default_idx
 
-    col_placeholder = _find_col("placeholder_name", 1)
+    col_placeholder = _find_col("variable_name", 1)
     col_old        = _find_col("old_value", 2)
     col_prompt     = _find_col("prompt", 3)
     col_new        = _find_col("new_value", 4)
@@ -740,7 +740,7 @@ _LABELS_RE = re.compile(r'(' + r'|'.join(_FINANCIAL_LABELS) + r')', flags=re.IGN
 
 def _detect_standard_and_context_spans(context: str) -> List[Tuple[str, str, str]]:
     """
-    Return list of tuples (old_value, change_type, placeholder_name_hint)
+    Return list of tuples (old_value, change_type, variable_name_hint)
     found by regex scanning of context.
     - Standardized patterns (FY, dates) get change_type "Standardized change"
     - Numeric financial occurrences near labels get change_type "Contextual change"
@@ -839,7 +839,7 @@ def _augment_with_regex_detections(path_or_file, context: str) -> str | None:
 
         # Ensure header contains change_type column as 5th column
         headers = [ws.cell(row=1, column=i).value for i in range(1, 6)]
-        required = ["placeholder_name", "old_value", "prompt", "new_value", "change_type"]
+        required = ["variable_name", "old_value", "prompt", "new_value", "change_type"]
         for i, name in enumerate(required, start=1):
             if (i > len(headers)) or (headers[i-1] != name):
                 ws.cell(row=1, column=i, value=name)
