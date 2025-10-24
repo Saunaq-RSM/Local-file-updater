@@ -12,6 +12,13 @@
 
 import requests
 from docx import Document
+
+rom docx.text.paragraph import Paragraph
+from docx.table import Table
+from docx.oxml.text.paragraph import CT_P
+from docx.oxml.table import CT_Tbl
+from docx.oxml.ns import qn
+
 import pdfplumber
 import pandas as pd
 
@@ -20,11 +27,15 @@ import io
 import time
 import tempfile
 import openpyxl
+
 from collections import OrderedDict
+from collections import defaultdict
 from typing import Tuple, Dict, List
 from pydantic import BaseModel, TypeAdapter
-from docx.oxml.ns import qn
-import re
+
+import re, math, json
+from dataclasses import dataclass
+
 
 # Azure OpenAI config (set by frontend)
 API_KEY = None
@@ -718,108 +729,203 @@ def load_template(template_file) -> str:
 # -------------------------
 
 # Patterns for standardized date/year tokens
-_RE_FY = re.compile(r'\bFY\s?\d{2,4}\b', flags=re.IGNORECASE)
-_RE_FULL_DATE_1 = re.compile(r'\b(?:\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})\b', flags=re.IGNORECASE)
-_RE_FULL_DATE_2 = re.compile(r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:st|nd|rd|th)?(?:,)?\s+\d{4}\b', flags=re.IGNORECASE)
-_RE_FINANCIAL_YEAR_PHRASE = re.compile(r'\bFinancial Year(?: Ended)?[^\n]{0,60}\d{4}\b', flags=re.IGNORECASE)
 
-# Patterns for contextual numeric values (percent, euro, plain decimal with separators)
-_RE_PERCENT = re.compile(r'\b\d{1,3}(?:[.,]\d+)?\s?%')
-_RE_EURO = re.compile(r'€\s?[0-9\.,]+')
-_RE_NUMBER = re.compile(r'\b\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?\b')
+# ------------ Patterns ------------
 
-# Keywords to anchor contextual number extraction
-_FINANCIAL_LABELS = [
-    r'net turnover', r'gross profit', r'cost of raw material', r'sales to customers',
-    r'transaction amount', r'percentage of the sales', r'percentage', r'berry ratio',
-    r'median', r'upper quartile', r'lower quartile', r'minimum', r'maximum',
-    r'number of observation', r'observations', r'fte', r'employees', r'revenue', r'gross profit', r'expenses', r'amotisation', r'operating result',
+RE_FY          = re.compile(r'\bFY[E]?\s?\d{2,4}(?:/\d{2})?\b', flags=re.IGNORECASE)
+RE_YEAR        = re.compile(r'\b(19|20)\d{2}\b')
+RE_YR_RANGE    = re.compile(r'\b(19|20)\d{2}\s?[-–/]\s?(19|20)\d{2}\b')
+RE_DATE_DMY    = re.compile(r'\b\d{1,2}\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\b', re.I)
+RE_DATE_MDY    = re.compile(r'\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(st|nd|rd|th)?[,]?\s+\d{4}\b', re.I)
+RE_FINYEAR_PH  = re.compile(r'\b(?:Financial|Fiscal)\s+Year(?:\s+Ended)?[^\n]{0,80}\b(19|20)\d{2}\b', re.I)
+RE_FOR_YE_PH   = re.compile(r'\b(?:For|Year)\s+the\s+year\s+ended[^\n]{0,50}\b(19|20)\d{2}\b', re.I)
+
+RE_PERCENT     = re.compile(r'[-(]?\s*\d{1,3}(?:[.,]\d+)?\s?%\s*[)]?')
+RE_CURRENCY    = re.compile(r'(?:€|EUR|\\$)\\s*[-(]?[0-9]{1,3}(?:[.,]\\d{3})*(?:[.,]\\d+)?[)]?')
+RE_NUMBER      = re.compile(r'\\b-?\\d{1,3}(?:[.,]\\d{3})*(?:[.,]\\d+)?\\b')
+
+RE_SECTIONNUM  = re.compile(r'^\\d+(?:\\.\\d+)+$')  # e.g., 6.3, 2.10.1
+
+LABELS = [
+    'net turnover','gross profit','cost of raw material','sales to customers','transaction amount',
+    'percentage of the sales','percentage','berry ratio','median','upper quartile','lower quartile',
+    'minimum','maximum','number of observation','observations','fte','employees','revenue','expenses',
+    'amortisation','depreciation','operating result','weighted average','canada','europe','related parties'
 ]
-_LABELS_RE = re.compile(r'(' + r'|'.join(_FINANCIAL_LABELS) + r')', flags=re.IGNORECASE)
+LABELS_RE = re.compile(r'(' + r'|'.join(re.escape(x) for x in LABELS) + r')', re.I)
 
+def canonicalize_num(txt: str) -> str:
+    t = txt.strip().replace('\u00A0', ' ')
+    t = re.sub(r'\bEUR\s*', '€ ', t, flags=re.I)  # normalize EUR
+    if t.startswith('(') and t.endswith(')'):
+        t = '-' + t[1:-1]
+    # collapse floating garbage: 316.08800000000002 -> 316.088
+    t = re.sub(r'(\d+\.\d{2})\d+', r'\1', t)
+    # remove extra spaces before %
+    t = re.sub(r'\s+%', '%', t)
+    return t
 
-def _detect_standard_and_context_spans(context: str) -> List[Tuple[str, str, str]]:
-    """
-    Return list of tuples (old_value, change_type, variable_name_hint)
-    found by regex scanning of context.
-    - Standardized patterns (FY, dates) get change_type "Standardized change"
-    - Numeric financial occurrences near labels get change_type "Contextual change"
-    This is conservative to avoid adding every stray number.
-    """
-    results = []
-    if not context:
-        return results
+@dataclass
+class Hit:
+    source: str
+    location: str
+    label: str
+    value: str
+    change_type: str
+    confidence: float
+    rationale: str
 
-    # 1) Find FY tokens
-    for m in _RE_FY.finditer(context):
-        val = m.group(0).strip()
-        results.append((val, "Standardized change", "financial_year"))
+def iter_blocks(doc: Document):
+    def _items(parent):
+        parent_elm = parent.element if hasattr(parent, 'element') else parent
+        for child in parent_elm.iterchildren():
+            if isinstance(child, CT_P):
+                yield ('p', Paragraph(child, parent))
+            elif isinstance(child, CT_Tbl):
+                yield ('t', Table(child, parent))
+    for block in _items(doc):
+        yield block
 
-    # 2) Find explicit date expressions (e.g., '31 December 2023' or 'December 31st 2023')
-    for m in _RE_FULL_DATE_1.finditer(context):
-        val = m.group(0).strip()
-        results.append((val, "Standardized change", "financial_year"))
-    for m in _RE_FULL_DATE_2.finditer(context):
-        val = m.group(0).strip()
-        results.append((val, "Standardized change", "financial_year"))
-    for m in _RE_FINANCIAL_YEAR_PHRASE.finditer(context):
-        val = m.group(0).strip()
-        results.append((val, "Standardized change", "financial_year"))
+def sentence_splits(text: str) -> List[str]:
+    return re.split(r'(?<=[.!?])\s+', text)
 
-    # 3) Find contextual numeric values anchored by known labels
-    # For each occurrence of a label, look ahead/back for a number/percent/euro within ~60 chars
-    for m in _LABELS_RE.finditer(context):
-        start = max(0, m.start() - 100)
-        end = min(len(context), m.end() + 100)
-        window = context[start:end]
-        # prefer percent, then euro, then plain number
-        pm = _RE_PERCENT.search(window)
-        if pm:
-            results.append((pm.group(0).strip(), "Contextual change", m.group(0).strip()))
+def detect_in_paragraph(text: str) -> List[Hit]:
+    hits = []
+    # Standardized tokens
+    for rx in (RE_FY, RE_DATE_DMY, RE_DATE_MDY, RE_FINYEAR_PH, RE_FOR_YE_PH, RE_YR_RANGE):
+        for m in rx.finditer(text):
+            hits.append(Hit('DOCX', 'paragraph', 'financial_year', canonicalize_num(m.group(0)),
+                           'Standardized change', 0.95, f'match:{rx.pattern[:20]}...'))
+    # Contextual numbers
+    for sent in sentence_splits(text):
+        for m in LABELS_RE.finditer(sent):
+            label = m.group(0)
+            # Look for % then currency then number in same sentence
+            for rx in (RE_PERCENT, RE_CURRENCY, RE_NUMBER):
+                nm = rx.search(sent)
+                if not nm:
+                    continue
+                val = canonicalize_num(nm.group(0))
+                if RE_SECTIONNUM.match(val):
+                    continue
+                ctype = 'Standardized change' if RE_YEAR.fullmatch(val) else 'Contextual change'
+                conf = 0.80 if rx is RE_CURRENCY else 0.70 if rx is RE_PERCENT else 0.60
+                hits.append(Hit('DOCX', 'paragraph', label, val, ctype, conf,
+                                'same-sentence label+number'))
+                break
+    return hits
+def detect_in_table(tbl: Table) -> List[Hit]:
+    hits = []
+    rows = tbl.rows
+    for r in rows:
+        cells = [c.text.strip() for c in r.cells]
+        if not any(cells):
             continue
-        em = _RE_EURO.search(window)
-        if em:
-            results.append((em.group(0).strip(), "Contextual change", m.group(0).strip()))
+        # row-wise: if any cell is a label, scan the other cells for numbers
+        labels = [c for c in cells if LABELS_RE.search(c)]
+        if not labels:
             continue
-        nm = _RE_NUMBER.search(window)
-        if nm:
-            # exclude years like 2020..2030 when label not year-related (but allow if label indicates)
-            num = nm.group(0).strip()
-            # Heuristic: if number is 4-digit and between 1900 and 2100, treat as year -> Standardized
-            if re.match(r'^\d{4}$', num) and 1900 <= int(num) <= 2100:
-                results.append((num, "Standardized change", "financial_year"))
-            else:
-                results.append((num, "Contextual change", m.group(0).strip()))
-    # Deduplicate preserving order
-    seen = set()
+        numbers = []
+        for c in cells:
+            for rx in (RE_PERCENT, RE_CURRENCY, RE_NUMBER):
+                for m in rx.finditer(c):
+                    val = canonicalize_num(m.group(0))
+                    if RE_SECTIONNUM.match(val):
+                        continue
+                    numbers.append(val)
+        for lab in labels:
+            for val in numbers:
+                ctype = 'Standardized change' if RE_YEAR.fullmatch(val) else 'Contextual change'
+                conf = 0.92 if RE_CURRENCY.search(val) else 0.82 if RE_PERCENT.search(val) else 0.70
+                hits.append(Hit('DOCX', 'table-row', lab, val, ctype, conf,
+                                'table row label->value'))
+    return hits
+def scan_docx(docx_path: str) -> List[Hit]:
+    doc = Document(docx_path)
     out = []
-    for old, typ, hint in results:
-        key = (old, typ)
+    for kind, block in iter_blocks(doc):
+        if kind == 'p':
+            if block.text.strip():
+                out.extend(detect_in_paragraph(block.text))
+        else:
+            out.extend(detect_in_table(block))
+    # dedupe
+    seen = set()
+    dedup = []
+    for h in out:
+        key = (h.location, h.label.lower(), h.value, h.change_type)
         if key not in seen:
             seen.add(key)
-            out.append((old, typ, hint))
-    return out
+            dedup.append(h)
+    return dedup
 
+def scan_variables_xlsx(xlsx_path: str) -> pd.DataFrame:
+    df = pd.read_excel(xlsx_path, engine='openpyxl').fillna('')
+    cols = [c.strip().lower() for c in df.columns]
+    df.columns = cols
+    # normalize names
+    col_map = {
+        'variable': next((c for c in cols if 'variable' in c), None),
+        'old value': next((c for c in cols if 'old' in c and 'value' in c), None),
+        'new value': next((c for c in cols if 'new' in c and 'value' in c), None),
+        'type':      next((c for c in cols if c=='type' or 'type' in c), None),
+        'source':    next((c for c in cols if 'source' in c), None),
+    }
+    for want, got in col_map.items():
+        if got is None:
+            raise ValueError(f'Missing column for {want}')
+    return df.rename(columns={v:k for k,v in col_map.items() if v})
 
-def _classify_change_type(old_value: str) -> str | None:
-    """
-    Classify a single old_value string to 'Standardized change' or 'Contextual change' where possible.
-    """
-    if not old_value:
-        return None
-    ov = old_value.strip()
-    if _RE_FY.search(ov) or _RE_FULL_DATE_1.search(ov) or _RE_FULL_DATE_2.search(ov) or _RE_FINANCIAL_YEAR_PHRASE.search(ov):
-        return "Standardized change"
-    if _RE_PERCENT.search(ov) or _RE_EURO.search(ov):
-        return "Contextual change"
-    # plain numeric heuristics
-    if re.fullmatch(r'\d{1,3}(?:[.,]\d+)?', ov) or re.fullmatch(r'\d{1,3}(?:[.,]\d{3})+(?:[.,]\d+)?', ov):
-        # If looks like a year -> Standardized
-        if re.fullmatch(r'\d{4}', ov) and 1900 <= int(ov) <= 2100:
-            return "Standardized change"
-        return "Contextual change"
-    return None
+def build_change_log(doc_hits: List[Hit], df_vars: pd.DataFrame) -> pd.DataFrame:
+    # match by value and/or by fuzzy label containment
+    rows = []
+    for h in doc_hits:
+        candidate_type = 'Standardized change' if h.change_type == 'Standardized change' else 'Contextual change'
+        rows.append({
+            'source': h.source,
+            'location': h.location,
+            'label_hint': h.label,
+            'old_value': h.value,
+            'change_type': candidate_type,
+            'confidence': h.confidence,
+            'rationale': h.rationale,
+        })
+    out = pd.DataFrame(rows)
+    # optional: link to variables sheet by label or value equality
+    if not df_vars.empty:
+        out['linked_variable'] = ''
+        out['proposed_new_value'] = ''
+        for i, r in out.iterrows():
+            # try exact old value match first
+            m = df_vars[df_vars['old value'].astype(str).str.strip() == r['old_value']]
+            if m.empty:
+                # try label keyword match
+                m = df_vars[df_vars['variable'].str.lower().str.contains(re.escape(r['label_hint'].lower()), na=False)]
+            if not m.empty:
+                out.at[i, 'linked_variable']   = m.iloc[0]['variable']
+                out.at[i, 'proposed_new_value'] = m.iloc[0]['new value']
+    return out.sort_values(['change_type','confidence'], ascending=[True, False])
 
+def rollforward_year_tokens(text: str, from_year: int, to_year: int) -> str:
+    # FY tokens
+    text = re.sub(fr'\\bFYE?\\s?{from_year}\\b', f'FY{to_year}', text, flags=re.I)
+    text = re.sub(fr'\\bFY\\s?{from_year}\\b',   f'FY{to_year}', text, flags=re.I)
+    # full dates
+    text = re.sub(fr'(\\b\\d{{1,2}}\\s+(January|February|March|April|May|June|July|August|September|October|November|December)\\s+){from_year}\\b',
+                  rf'\\g<1>{to_year}', text, flags=re.I)
+    text = re.sub(fr'((January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{{1,2}}(?:st|nd|rd|th)?(?:,)?\\s+){from_year}\\b',
+                  rf'\\g<1>{to_year}', text, flags=re.I)
+    # phrases
+    text = re.sub(fr'\\b(Financial|Fiscal)\\s+Year(?:\\s+Ended)?([^\\n]{{0,80}}){from_year}\\b',
+                  rf'\\1 Year\\2{to_year}', text, flags=re.I)
+    # ranges 2020–2022 -> 2021–2023
+    def _bump_range(m):
+        a, b = int(m.group(1)), int(m.group(2))
+        shift = to_year - from_year
+        return f'{a+shift}–{b+shift}'
+    text = re.sub(fr'\\b((19|20)\\d{{2})\\s*[–-]\\s*((19|20)\\d{{2})\\b)', 
+                  lambda m: f'{int(m.group(2))+to_year-from_year}–{int(m.group(4))+to_year-from_year}', text)
+    return text
 
 def _augment_with_regex_detections(path_or_file, context: str) -> str | None:
     """
