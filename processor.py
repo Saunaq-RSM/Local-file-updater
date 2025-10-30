@@ -996,7 +996,7 @@ def rollforward_year_tokens(text: str, from_year: int, to_year: int) -> str:
 
     # ranges e.g. 2020–2022 → 2021–2023
     text = re.sub(
-        fr'\b((19|20)\d{{2})\s*[–-]\s*((19|20)\d{{2}))\b',
+        fr'\b((19|20)\d{{2}})\s*[–-]\s*((19|20)\d{{2}}))\b',
         lambda m: f'{int(m.group(1)) + (to_year - from_year)}–{int(m.group(3)) + (to_year - from_year)}',
         text
     )
