@@ -31,7 +31,7 @@ import openpyxl
 
 from collections import OrderedDict
 from collections import defaultdict
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Optional
 from pydantic import BaseModel, TypeAdapter
 
 import re, math, json
@@ -449,7 +449,7 @@ def load_guidelines(file) -> str:
         return ""
 
 
-def _prefill_last_year_from_prompts(excel_file, context: str) -> str | None:
+def _prefill_last_year_from_prompts(excel_file, context: str) -> Optional[str]:
     """
     Uses ask_variable_list(context) to produce rows and writes them into an excel workbook
     (creates workbook if necessary). Adds a 'change_type' column to help classify rows.
@@ -525,7 +525,7 @@ def _prefill_last_year_from_prompts(excel_file, context: str) -> str | None:
         return None
 
 
-def load_and_annotate_replacements(excel_file, context: str) -> Tuple[Dict[str, str], str | None]:
+def load_and_annotate_replacements(excel_file, context: str) -> Tuple[Dict[str, str], Optional[str]]:
     """
     Loads/creates workbook; for each row with a prompt calls LLM to fill new_value.
     Returns (replacements_dict, filled_excel_path).
@@ -994,7 +994,7 @@ def rollforward_year_tokens(text: str, from_year: int, to_year: int) -> str:
                   lambda m: f'{int(m.group(2))+to_year-from_year}–{int(m.group(4))+to_year-from_year}', text)
     return text
 
-def _augment_with_regex_detections(path_or_file, context: str) -> str | None:
+def _augment_with_regex_detections(path_or_file, context: str) -> Optional[str]:
     """
     Given an excel path or file-like, load workbook, ensure headers include change_type,
     append detected rows from _detect_standard_and_context_spans where the old_value is not already present,
