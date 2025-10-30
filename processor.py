@@ -13,11 +13,12 @@
 import requests
 from docx import Document
 
-rom docx.text.paragraph import Paragraph
+from docx.text.paragraph import Paragraph
 from docx.table import Table
 from docx.oxml.text.paragraph import CT_P
 from docx.oxml.table import CT_Tbl
 from docx.oxml.ns import qn
+
 
 import pdfplumber
 import pandas as pd
@@ -35,6 +36,8 @@ from pydantic import BaseModel, TypeAdapter
 
 import re, math, json
 from dataclasses import dataclass
+
+
 
 
 # Azure OpenAI config (set by frontend)
@@ -312,6 +315,70 @@ CONTEXT_END>>>
 
     raise RuntimeError(f"ask_variable_list failed after {max_retries} attempts: {last_exception}")
 
+def _classify_change_type(old_value: str) -> str:
+    """
+    Return 'Standardized change' for date/FY/year-like tokens, otherwise
+    'Contextual change' for numbers/currency/percent-like tokens, else ''.
+    """
+    if not old_value:
+        return ""
+    try:
+        s = str(old_value)
+        if RE_FY.search(s) or RE_DATE_DMY.search(s) or RE_DATE_MDY.search(s) or RE_FINYEAR_PH.search(s) or RE_YR_RANGE.search(s) or RE_YEAR.search(s):
+            return "Standardized change"
+        if RE_PERCENT.search(s) or RE_CURRENCY.search(s) or RE_NUMBER.search(s):
+            return "Contextual change"
+    except Exception:
+        pass
+    return ""
+
+
+def _detect_standard_and_context_spans(context: str):
+    """
+    Lightweight extractor that returns a list of tuples:
+      (old_value: str, change_type: str, hint: str)
+    This supplements LLM output with regex-based detections for:
+      - FY/date/year tokens (Standardized change)
+      - Labelled numbers near known labels (Contextual change)
+    """
+    out = []
+    seen = set()
+
+    if not context:
+        return out
+
+    # 1) Standard date/year/FY tokens (take unique matches)
+    for rx in (RE_FY, RE_DATE_DMY, RE_DATE_MDY, RE_FINYEAR_PH, RE_FOR_YE_PH, RE_YR_RANGE, RE_YEAR):
+        for m in rx.finditer(context):
+            val = m.group(0).strip()
+            if val and val not in seen:
+                seen.add(val)
+                out.append((val, "Standardized change", "financial_year"))
+
+    # 2) Contextual: scan sentences for known labels and numbers
+    for sent in sentence_splits(context):
+        # only examine sentences that contain a label token
+        if not LABELS_RE.search(sent):
+            continue
+        # find candidate numbers/currency/percents in the sentence
+        for rx in (RE_PERCENT, RE_CURRENCY, RE_NUMBER):
+            for m in rx.finditer(sent):
+                val = canonicalize_num(m.group(0))
+                if not val:
+                    continue
+                # avoid section numbers like "6.3"
+                if RE_SECTIONNUM.match(val):
+                    continue
+                if val in seen:
+                    continue
+                seen.add(val)
+                hint_m = LABELS_RE.search(sent)
+                hint = hint_m.group(0) if hint_m else ""
+                change_type = "Contextual change" if not RE_YEAR.fullmatch(val) else "Standardized change"
+                out.append((val, change_type, hint or "labelled_value"))
+
+    # 3) Return as list of tuples (old_value, change_type, hint)
+    return out
 
 def fill_excel_prompts(prompt: str, context: str, old_value: str, variable_name: str) -> str:
     """
