@@ -808,8 +808,8 @@ RE_FINYEAR_PH  = re.compile(r'\b(?:Financial|Fiscal)\s+Year(?:\s+Ended)?[^\n]{0,
 RE_FOR_YE_PH   = re.compile(r'\b(?:For|Year)\s+the\s+year\s+ended[^\n]{0,50}\b(19|20)\d{2}\b', re.I)
 
 RE_PERCENT     = re.compile(r'[-(]?\s*\d{1,3}(?:[.,]\d+)?\s?%\s*[)]?')
-RE_CURRENCY    = re.compile(r'(?:€|EUR|\\$)\\s*[-(]?[0-9]{1,3}(?:[.,]\\d{3})*(?:[.,]\\d+)?[)]?')
-RE_NUMBER      = re.compile(r'\\b-?\\d{1,3}(?:[.,]\\d{3})*(?:[.,]\\d+)?\\b')
+RE_CURRENCY = re.compile(r'(?:€|EUR|\$)\s*[-(]?[0-9]{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?[)]?')
+RE_NUMBER   = re.compile(r'\b-?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?\b')
 
 RE_SECTIONNUM  = re.compile(r'^\\d+(?:\\.\\d+)+$')  # e.g., 6.3, 2.10.1
 
