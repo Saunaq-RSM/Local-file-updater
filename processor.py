@@ -975,23 +975,32 @@ def build_change_log(doc_hits: List[Hit], df_vars: pd.DataFrame) -> pd.DataFrame
 
 def rollforward_year_tokens(text: str, from_year: int, to_year: int) -> str:
     # FY tokens
-    text = re.sub(fr'\\bFYE?\\s?{from_year}\\b', f'FY{to_year}', text, flags=re.I)
-    text = re.sub(fr'\\bFY\\s?{from_year}\\b',   f'FY{to_year}', text, flags=re.I)
+    text = re.sub(fr'\bFYE?\s?{from_year}\b', f'FY{to_year}', text, flags=re.I)
+    text = re.sub(fr'\bFY\s?{from_year}\b',   f'FY{to_year}', text, flags=re.I)
+    
     # full dates
-    text = re.sub(fr'(\\b\\d{{1,2}}\\s+(January|February|March|April|May|June|July|August|September|October|November|December)\\s+){from_year}\\b',
-                  rf'\\g<1>{to_year}', text, flags=re.I)
-    text = re.sub(fr'((January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{{1,2}}(?:st|nd|rd|th)?(?:,)?\\s+){from_year}\\b',
-                  rf'\\g<1>{to_year}', text, flags=re.I)
+    text = re.sub(
+        fr'(\b\d{{1,2}}\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+){from_year}\b',
+        rf'\g<1>{to_year}', text, flags=re.I
+    )
+    text = re.sub(
+        fr'((January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{{1,2}}(?:st|nd|rd|th)?(?:,)?\s+){from_year}\b',
+        rf'\g<1>{to_year}', text, flags=re.I
+    )
+
     # phrases
-    text = re.sub(fr'\\b(Financial|Fiscal)\\s+Year(?:\\s+Ended)?([^\\n]{{0,80}}){from_year}\\b',
-                  rf'\\1 Year\\2{to_year}', text, flags=re.I)
-    # ranges 2020–2022 -> 2021–2023
-    def _bump_range(m):
-        a, b = int(m.group(1)), int(m.group(2))
-        shift = to_year - from_year
-        return f'{a+shift}–{b+shift}'
-    text = re.sub(fr'\\b((19|20)\\d{{2})\\s*[–-]\\s*((19|20)\\d{{2})\\b)', 
-                  lambda m: f'{int(m.group(2))+to_year-from_year}–{int(m.group(4))+to_year-from_year}', text)
+    text = re.sub(
+        fr'\b(Financial|Fiscal)\s+Year(?:\s+Ended)?([^\n]{{0,80}}){from_year}\b',
+        rf'\1 Year\2{to_year}', text, flags=re.I
+    )
+
+    # ranges e.g. 2020–2022 → 2021–2023
+    text = re.sub(
+        fr'\b((19|20)\d{{2})\s*[–-]\s*((19|20)\d{{2}))\b',
+        lambda m: f'{int(m.group(1)) + (to_year - from_year)}–{int(m.group(3)) + (to_year - from_year)}',
+        text
+    )
+
     return text
 
 def _augment_with_regex_detections(path_or_file, context: str) -> Optional[str]:
