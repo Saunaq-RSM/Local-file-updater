@@ -1,24 +1,238 @@
 import io
 import os
 import tempfile
+import traceback
 import pandas as pd
 import streamlit as st
-from processor import configure, find_relevant_variables, fill_section_values, generate_doc_from_excel_map
+
+# Try to import the real processor. If that fails, capture the traceback and provide
+# lightweight fallback implementations so the Streamlit UI still loads and the user
+# can see the import error and continue with a minimal flow.
+PROCESSOR_OK = False
+_processor_import_error = None
+
+try:
+    from processor import configure, find_relevant_variables, fill_section_values, generate_doc_from_excel_map
+    PROCESSOR_OK = True
+except Exception:
+    _processor_import_error = traceback.format_exc()
+    PROCESSOR_OK = False
+
+    # Minimal fallback "processor" functions so the app can start even if processor.py fails to import.
+    # These are intentionally simple and do not depend on heavy third-party packages.
+    _CONFIG = {"api_key": None, "api_endpoint": None}
+
+    def configure(api_key: str, api_endpoint: str):
+        _CONFIG["api_key"] = api_key
+        _CONFIG["api_endpoint"] = api_endpoint
+
+    def _create_blank_variables_xlsx(path: str):
+        # Create a minimal variables workbook using pandas (DataFrame -> xlsx).
+        df = pd.DataFrame(columns=["variable_name", "old_value", "prompt", "new_value", "change_type"])
+        try:
+            df.to_excel(path, index=False)
+            return True
+        except Exception:
+            # If writing xlsx fails, fallback to csv (still gives user a file to edit)
+            try:
+                path_csv = path.rsplit(".", 1)[0] + ".csv"
+                df.to_csv(path_csv, index=False)
+                return path_csv
+            except Exception:
+                return False
+
+    def find_relevant_variables(files: dict):
+        """
+        Fallback implementation:
+         - If user uploaded an excel, return it (write to disk if it's an UploadedFile).
+         - Otherwise create a blank workbook and a fallback docx that contains the import error.
+        Returns (doc_path, filled_excel_path)
+        """
+        tmpdir = tempfile.mkdtemp()
+        out_xlsx = os.path.join(tmpdir, "variables_prefilled_fallback.xlsx")
+
+        # If an excel file was provided as a file-like, persist it and return it
+        excel_file = files.get("excel") if files else None
+        if excel_file:
+            try:
+                # streamlit UploadedFile supports read()
+                content = excel_file.read()
+                with open(out_xlsx, "wb") as f:
+                    f.write(content)
+                # also produce a simple docx that notes we used the uploaded excel
+                doc_path = os.path.join(tmpdir, "fallback_preview.docx")
+                try:
+                    from docx import Document
+                    doc = Document()
+                    doc.add_heading("Fallback preview", level=1)
+                    doc.add_paragraph("Processor import failed. Using uploaded variables.xlsx as-is.")
+                    if _processor_import_error:
+                        doc.add_heading("Processor import error (truncated)", level=2)
+                        doc.add_paragraph(_processor_import_error[:3000])
+                    doc.save(doc_path)
+                except Exception:
+                    # If python-docx not available, write a plain text fallback
+                    doc_path = os.path.join(tmpdir, "fallback_preview.txt")
+                    with open(doc_path, "w") as f:
+                        f.write("Processor import failed. Using uploaded variables.xlsx as-is.\n\n")
+                        if _processor_import_error:
+                            f.write("Processor import error:\n")
+                            f.write(_processor_import_error)
+                return doc_path, out_xlsx
+            except Exception:
+                pass
+
+        # No excel uploaded — create blank workbook
+        created = _create_blank_variables_xlsx(out_xlsx)
+        if not created:
+            # cannot create xlsx/csv; return None results so UI can show an error
+            return None, None
+
+        tmpdir = tempfile.mkdtemp()
+        doc_path = os.path.join(tmpdir, "fallback_preview.docx")
+        try:
+            from docx import Document
+            doc = Document()
+            doc.add_heading("Fallback preview", level=1)
+            doc.add_paragraph("Processor import failed. A blank variables workbook has been created for you to edit.")
+            if _processor_import_error:
+                doc.add_heading("Processor import error (truncated)", level=2)
+                doc.add_paragraph(_processor_import_error[:3000])
+            doc.save(doc_path)
+        except Exception:
+            doc_path = os.path.join(tmpdir, "fallback_preview.txt")
+            with open(doc_path, "w") as f:
+                f.write("Processor import failed. A blank variables workbook has been created for you to edit.\n\n")
+                if _processor_import_error:
+                    f.write("Processor import error:\n")
+                    f.write(_processor_import_error)
+
+        return doc_path, out_xlsx
+
+    def fill_section_values(files):
+        """
+        Fallback: simply returns the excel passed in (persist it if it's file-like).
+        """
+        excel = files.get("excel") if files else None
+        if excel and hasattr(excel, "read"):
+            tmpdir = tempfile.mkdtemp()
+            out_xlsx = os.path.join(tmpdir, "variables_section_filled_fallback.xlsx")
+            try:
+                with open(out_xlsx, "wb") as f:
+                    f.write(excel.read())
+                return None, out_xlsx
+            except Exception:
+                return None
+        # If already a path string, return it
+        if isinstance(excel, str) and os.path.exists(excel):
+            return None, excel
+        # otherwise return None so UI can handle it
+        return None
+
+    def generate_doc_from_excel_map(file_map, context: str = ""):
+        """
+        Fallback: read the excel map if present, produce a simple docx listing placeholders/replacements.
+        """
+        excel = file_map.get("excel")
+        tmpdir = tempfile.mkdtemp()
+        doc_path = os.path.join(tmpdir, "generated_fallback.docx")
+
+        replacements = {}
+        try:
+            if excel and isinstance(excel, str) and os.path.exists(excel):
+                # try to read using pandas (will work if openpyxl is installed)
+                try:
+                    df = pd.read_excel(excel, engine="openpyxl")
+                    # normalize common names if present
+                    cols = [c.lower().strip() for c in df.columns]
+                    # Try to identify columns
+                    def find(col_names):
+                        for c in col_names:
+                            if c in cols:
+                                return df.columns[cols.index(c)]
+                        return None
+                    old_col = find(["old_value", "old value", "old"])
+                    new_col = find(["new_value", "new value", "new"])
+                    if old_col is not None and new_col is not None:
+                        for _, row in df.iterrows():
+                            o = str(row[old_col]) if not pd.isna(row[old_col]) else ""
+                            n = str(row[new_col]) if not pd.isna(row[new_col]) else ""
+                            if o and n and o != n:
+                                replacements[o] = n
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            from docx import Document
+            doc = Document()
+            doc.add_heading("Generated Document (Fallback)", level=1)
+            if replacements:
+                doc.add_heading("Applied replacements", level=2)
+                tbl = doc.add_table(rows=1, cols=2)
+                hdr = tbl.rows[0].cells
+                hdr[0].text = "Placeholder"
+                hdr[1].text = "Replacement"
+                for k, v in replacements.items():
+                    row_cells = tbl.add_row().cells
+                    row_cells[0].text = str(k)
+                    row_cells[1].text = str(v)
+            else:
+                doc.add_paragraph("No replacements found or processor unavailable.")
+            if _processor_import_error:
+                doc.add_heading("Processor import error (for debugging)", level=2)
+                doc.add_paragraph(_processor_import_error[:4000])
+            doc.save(doc_path)
+            return doc_path, (excel if isinstance(excel, str) else None)
+        except Exception:
+            # fallback to plain text
+            txt_path = os.path.join(tmpdir, "generated_fallback.txt")
+            with open(txt_path, "w") as f:
+                if replacements:
+                    f.write("Applied replacements:\n")
+                    for k, v in replacements.items():
+                        f.write(f"{k} -> {v}\n")
+                else:
+                    f.write("No replacements found or processor unavailable.\n\n")
+                if _processor_import_error:
+                    f.write("\nProcessor import error:\n")
+                    f.write(_processor_import_error)
+            return txt_path, (excel if isinstance(excel, str) else None)
 
 
-# Configure backend with secrets
-configure(
-    st.secrets["AZURE_API_KEY"],
-    st.secrets["AZURE_API_ENDPOINT"]
-)
+# ---- End of dynamic import / fallback setup ----
+
+# Configure backend with secrets (wrapped to avoid KeyError when secrets missing)
+try:
+    azure_key = st.secrets.get("AZURE_API_KEY")
+    azure_endpoint = st.secrets.get("AZURE_API_ENDPOINT")
+    if azure_key and azure_endpoint:
+        configure(azure_key, azure_endpoint)
+except Exception:
+    # If configure is not available for some reason, ignore; the fallback configure above will capture calls.
+    pass
 
 st.set_page_config(page_title="TP Template Updater", layout="wide")
 st.title("TP Agent 2 Yearly Update")
 
+# If processor import failed, show a prominent message with the traceback and suggested fixes
+if not PROCESSOR_OK:
+    st.error("processor.py failed to import. The app is running in fallback mode.")
+    with st.expander("Show processor import traceback (click to expand)"):
+        st.code(_processor_import_error or "No traceback captured")
+    st.info(
+        "Suggested fixes:\n"
+        "- Make sure you're running Python 3.10+ (the processor uses modern type syntax).\n"
+        "- Ensure required packages are installed: pydantic (v2), python-docx, pdfplumber, openpyxl, requests, pandas.\n"
+        "- Run `python -m py_compile processor.py` locally to spot syntax errors (or paste the traceback here for help).\n"
+        "While you fix processor.py the app will use a minimal fallback implementation so you can still edit/upload a variables workbook."
+    )
+
 st.download_button(
     "Download variables excel",
-    data = open("documents2/RSM NL - TP Agent 2 Yearly Update Variables - 18.09.2025 V1.xlsx", "rb").read(),
-    file_name="documents2/RSM NL - TP Agent 2 Yearly Update Variables - 18.09.2025 V1.xlsx",
+    data = None if not os.path.exists("documents2/RSM NL - TP Agent 2 Yearly Update Variables - 18.09.2025 V1.xlsx") else open("documents2/RSM NL - TP Agent 2 Yearly Update Variables - 18.09.2025 V1.xlsx", "rb").read(),
+    file_name="RSM_NL_Variables_example.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
 
@@ -44,8 +258,6 @@ analysis_file   = st.file_uploader("Financial Documents (.pdf) — optional", ty
 variables_file  = st.file_uploader("Variables (.xlsx) — REQUIRED", type=["xlsx"], key="u_excel")
 template_file   = st.file_uploader("Last year local file (.pptx/.docx) — REQUIRED for Step 2", type=["pptx", "docx"], key="u_template")
 
-# Prefill option (Boolean)
-
 # Session state: outputs & dataframes
 if "generated" not in st.session_state:
     st.session_state.generated = None
@@ -59,11 +271,6 @@ if "sheet_df" not in st.session_state:
     st.session_state.sheet_df = None
 if "sheet_path" not in st.session_state:
     st.session_state.sheet_path = None
-if "generated" not in st.session_state:
-    st.session_state.generated = None
-    
-# Keep editor widget state and script state in sync at the start of each run
-
 
 # Helper: write DF to a Windows-safe temp file and return the PATH
 def _df_to_temp_xlsx_path(df: pd.DataFrame) -> str:
@@ -105,8 +312,6 @@ def _persist_editor_from_state():
     if "editor_sheet" in st.session_state:
         _set_sheet(st.session_state.editor_sheet)
 
-# _persist_editor_from_state()
-
 # Build the file_map used by the backend; pass None for missing optionals
 base_file_map = {
     "guidelines": guidelines_file or None,
@@ -132,19 +337,33 @@ def run_step1_fill_and_preview():
             st.session_state.section_excel_path = None
 
             file_map_preview = dict(base_file_map)
+
             result = find_relevant_variables(file_map_preview)
-            excel_path = result[1] if isinstance(result, tuple) else result
+            # find_relevant_variables returns (doc_path, filled_excel_path)
+            excel_path = None
+            if isinstance(result, tuple):
+                excel_path = result[1]
+            elif isinstance(result, str):
+                excel_path = result
+
             if not excel_path:
                 st.error("No Excel produced by Step 1.")
                 return
 
-            df = pd.read_excel(excel_path, engine="openpyxl")
+            # Load the excel and normalize columns to include change_type and consistent headers
+            try:
+                df = pd.read_excel(excel_path, engine="openpyxl")
+            except Exception:
+                # If openpyxl missing or reading fails, try pandas default reader (may still fail)
+                df = pd.read_excel(excel_path)
+
             _set_sheet(df)  # <- overwrites session_state.sheet_df and sheet_path
             st.success("Variables filled from the latest run. Edit below.")
 
         except Exception as e:
             st.error(f"Error in Step 1: {e}")
-
+            # show traceback for debugging
+            st.exception(e)
 
 # ---------------- STEP 2 ----------------
 def run_step2_fill_sections():
@@ -157,17 +376,28 @@ def run_step2_fill_sections():
             file_map2 = dict(base_file_map)
             file_map2["excel"] = st.session_state.sheet_path  # pass the current saved path
             result = fill_section_values(file_map2)
-            section_excel_path = result[1] if isinstance(result, tuple) else result
+            section_excel_path = None
+            if isinstance(result, tuple):
+                section_excel_path = result[1]
+            elif isinstance(result, str):
+                section_excel_path = result
+            elif result is None:
+                section_excel_path = st.session_state.sheet_path
+
             if not section_excel_path:
                 st.error("Section-filling step did not return a valid Excel path.")
                 return
 
-            df2 = pd.read_excel(section_excel_path, engine="openpyxl")
+            try:
+                df2 = pd.read_excel(section_excel_path, engine="openpyxl")
+            except Exception:
+                df2 = pd.read_excel(section_excel_path)
             _set_sheet(df2)  # update the ONE global sheet
             st.success("Section values filled. You can keep editing below.")
 
         except Exception as e:
             st.error(f"Error in Step 2: {e}")
+            st.exception(e)
 # If a sheet exists, we already show the editor above and auto-persist + download button
 
 # ---------------- STEP 3 ----------------
@@ -190,15 +420,19 @@ def run_step3_generate():
             else:
                 doc_path, excel_path = result, None
 
+            # If returned path is not a docx/pptx (text fallback), still show as downloadable plain file
             with open(doc_path, "rb") as f:
                 doc_bytes = f.read()
 
             if doc_path.endswith(".pptx"):
                 doc_name = "filled.pptx"
                 doc_mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-            else:
+            elif doc_path.endswith(".docx"):
                 doc_name = "filled.docx"
                 doc_mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            else:
+                doc_name = os.path.basename(doc_path)
+                doc_mime = "text/plain"
 
             excel_bytes = None
             if excel_path:
@@ -220,6 +454,7 @@ def run_step3_generate():
         except Exception as e:
             st.session_state.generated = None
             st.error(f"Error in Step 3: {e}")
+            st.exception(e)
 
 # ---------------- Buttons (inline, no on_click) ----------------
 st.divider()
