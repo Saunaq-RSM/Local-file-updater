@@ -3,7 +3,11 @@ import os
 import tempfile
 import pandas as pd
 import streamlit as st
-from .processor import configure, find_relevant_variables, fill_section_values, generate_doc_from_excel_map
+
+import sys
+sys.path.append(os.path.dirname(__file__))
+
+from processor import configure, find_relevant_variables, fill_section_values, generate_doc_from_excel_map
 
 # Configure backend with secrets
 configure(
