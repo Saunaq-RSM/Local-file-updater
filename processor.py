@@ -376,7 +376,31 @@ def _detect_standard_and_context_spans(context: str):
                 hint = hint_m.group(0) if hint_m else ""
                 change_type = "Contextual change" if not RE_YEAR.fullmatch(val) else "Standardized change"
                 out.append((val, change_type, hint or "labelled_value"))
+                
+    lines = context.splitlines()
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(("-", "•", "*")):  # bullet point
+            for rx in (RE_PERCENT, RE_CURRENCY, RE_NUMBER):
+                for m in rx.finditer(stripped):
+                    val = canonicalize_num(m.group(0))
+                    if not val:
+                        continue
+                    if RE_SECTIONNUM.match(val):   # skip 6.3 etc
+                        continue
+                    if val in seen:
+                        continue
+                    seen.add(val)
+                    out.append((val, "Contextual change", "bullet_value"))
 
+    for m in RE_PERCENT.finditer(context):
+        val = canonicalize_num(m.group(0))
+        if not val:
+            continue
+        if val in seen:
+            continue
+        seen.add(val)
+        out.append((val, "Contextual change", "percent_value"))
     # 3) Return as list of tuples (old_value, change_type, hint)
     return out
 
@@ -448,6 +472,110 @@ def load_guidelines(file) -> str:
     except Exception:
         return ""
 
+def suggest_variable_name_from_context(
+    old_value: str,
+    hint: str,
+    context: str,
+    max_len: int = 80
+) -> str:
+    """
+    Use the LLM to generate a concise, descriptive variable_name for a regex-detected value
+    based on its local context. Falls back to the hint/old_value if anything fails.
+
+    - max_len: hard cap on label length (for usability in Excel).
+    """
+    base_fallback = (hint or str(old_value or "")).strip()
+    if not old_value:
+        return base_fallback[:max_len]
+
+    # If we don't have API config, just return the heuristic hint.
+    if not API_KEY or not API_ENDPOINT:
+        return base_fallback[:max_len]
+
+    # Extract a local snippet around the detected value
+    try:
+        ctx = context or ""
+        if not ctx:
+            snippet = ""
+        else:
+            lower_ctx = ctx.lower()
+            needle = str(old_value).lower()
+            idx = lower_ctx.find(needle)
+            if idx == -1:
+                # Fallback: first 600 chars of context
+                snippet = ctx[:600]
+            else:
+                window = 250  # chars on each side
+                start = max(0, idx - window)
+                end   = min(len(ctx), idx + len(needle) + window)
+                snippet = ctx[start:end]
+    except Exception:
+        snippet = ""
+
+    try:
+        headers = {"Content-Type": "application/json", "api-key": API_KEY}
+
+        system_msg = (
+            "You name placeholders in financial / transfer pricing documents. "
+            "Given a detected numeric or date value and its local context, "
+            "you return ONLY a short, human-readable variable name. "
+            "No quotes, no explanations, no numbering. "
+            "The name should be specific enough that a user immediately knows "
+            "what the value refers to, but not longer than about 5–8 words."
+        )
+
+        user_msg = f"""
+We detected a value in a document and need a good spreadsheet variable name.
+
+Detected value (do NOT repeat this in the name): {old_value}
+Heuristic label (may be generic or incomplete): {hint or "<none>"}
+
+Local context excerpt (raw document text):
+<<<
+{snippet}
+>>>
+
+Task:
+- Propose a concise, descriptive variable name that refers to WHAT this value represents.
+- Do NOT include the actual number or year in the name.
+- Do NOT include quotes or any leading labels like "Variable:".
+- Keep it short (max ~5–8 words).
+
+Return only the name.
+""".strip()
+
+        payload = {
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            "temperature": 0,
+            "top_p": 1,
+            "seed": 13,
+        }
+
+        resp = requests.post(API_ENDPOINT, headers=headers, json=payload, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        text = (data.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "") or "").strip()
+
+        if not text:
+            return base_fallback[:max_len]
+
+        # Use first line only and strip surrounding quotes
+        name = text.splitlines()[0].strip().strip('"').strip("'")
+        if not name:
+            return base_fallback[:max_len]
+
+        if len(name) > max_len:
+            name = name[:max_len].rstrip()
+
+        return name
+    except Exception as e:
+        print(f"[suggest_variable_name_from_context] failed: {e}")
+        return base_fallback[:max_len]
 
 def _prefill_last_year_from_prompts(excel_file, context: str) -> Optional[str]:
     """
@@ -509,12 +637,17 @@ def _prefill_last_year_from_prompts(excel_file, context: str) -> Optional[str]:
                 existing_old_to_row[old_value] = ws.max_row
 
         # Augment with regex-based standard/context detections (do not duplicate existing old_values)
+        # Augment with regex-based standard/context detections (do not duplicate existing old_values)
         detected = _detect_standard_and_context_spans(context)
-        for old_val, change_type, variable_name in detected:
+        for old_val, change_type, hint in detected:
             if old_val and old_val not in existing_old_to_row:
-                ws.append([variable_name or "", old_val, "", "", change_type])
+                suggested_name = suggest_variable_name_from_context(
+                    old_value=old_val,
+                    hint=hint,
+                    context=context,
+                )
+                ws.append([suggested_name or (hint or ""), old_val, "", "", change_type])
                 existing_old_to_row[old_val] = ws.max_row
-
         tmpdir = tempfile.mkdtemp()
         out_path = os.path.join(tmpdir, "variables_prefilled.xlsx")
         wb.save(out_path)
@@ -807,7 +940,10 @@ RE_DATE_MDY    = re.compile(r'\b(January|February|March|April|May|June|July|Augu
 RE_FINYEAR_PH  = re.compile(r'\b(?:Financial|Fiscal)\s+Year(?:\s+Ended)?[^\n]{0,80}\b(19|20)\d{2}\b', re.I)
 RE_FOR_YE_PH   = re.compile(r'\b(?:For|Year)\s+the\s+year\s+ended[^\n]{0,50}\b(19|20)\d{2}\b', re.I)
 
-RE_PERCENT     = re.compile(r'[-(]?\s*\d{1,3}(?:[.,]\d+)?\s?%\s*[)]?')
+RE_PERCENT = re.compile(
+    r'[-(]?\s*\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?%|[-(]?\s*\d+(?:[.,]\d+)?%',
+    re.UNICODE
+)
 RE_CURRENCY = re.compile(r'(?:€|EUR|\$)\s*[-(]?[0-9]{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?[)]?')
 RE_NUMBER   = re.compile(r'\b-?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?\b')
 
@@ -827,7 +963,6 @@ def canonicalize_num(txt: str) -> str:
     if t.startswith('(') and t.endswith(')'):
         t = '-' + t[1:-1]
     # collapse floating garbage: 316.08800000000002 -> 316.088
-    t = re.sub(r'(\d+\.\d{2})\d+', r'\1', t)
     # remove extra spaces before %
     t = re.sub(r'\s+%', '%', t)
     return t
@@ -1039,9 +1174,16 @@ def _augment_with_regex_detections(path_or_file, context: str) -> Optional[str]:
         detected = _detect_standard_and_context_spans(context)
         for old_val, change_type, hint in detected:
             if old_val and old_val not in existing:
-                # Append with placeholder hint (lowercase, underscore)
-                placeholder_hint = hint.lower().replace(" ", "_")[:64] if hint else ""
-                ws.append([placeholder_hint, old_val, "", "", change_type])
+                # Use LLM to derive a user-friendly variable name from local context
+                suggested_name = suggest_variable_name_from_context(
+                    old_value=old_val,
+                    hint=hint,
+                    context=context,
+                )
+                if not suggested_name and hint:
+                    # Fallback: legacy underscored hint
+                    suggested_name = hint.lower().replace(" ", "_")[:64]
+                ws.append([suggested_name or "", old_val, "", "", change_type])
                 existing.add(old_val)
 
         tmpdir = tempfile.mkdtemp()
